@@ -10,8 +10,9 @@ defmodule SymphonyElixir.PromptBuilder do
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
     template =
-      Workflow.current()
-      |> prompt_template!()
+      opts
+      |> Keyword.get(:prompt_template)
+      |> prompt_template_or_current!()
       |> parse_template!()
 
     template
@@ -23,7 +24,11 @@ defmodule SymphonyElixir.PromptBuilder do
       @render_opts
     )
     |> IO.iodata_to_binary()
+    |> append_comment_command_context(Keyword.get(opts, :comment_command_context))
   end
+
+  defp prompt_template_or_current!(prompt) when is_binary(prompt), do: default_prompt(prompt)
+  defp prompt_template_or_current!(_prompt), do: Workflow.current() |> prompt_template!()
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
 
@@ -61,4 +66,33 @@ defmodule SymphonyElixir.PromptBuilder do
       prompt
     end
   end
+
+  defp append_comment_command_context(prompt, nil), do: prompt
+
+  defp append_comment_command_context(prompt, context) when is_map(context) do
+    command = Map.get(context, :command) || Map.get(context, "command") || ""
+    arguments = Map.get(context, :arguments) || Map.get(context, "arguments") || ""
+    comment_id = Map.get(context, :comment_id) || Map.get(context, "comment_id") || ""
+    body = Map.get(context, :body) || Map.get(context, "body") || ""
+
+    prompt <>
+      """
+
+      ## Triggering Linear Comment Command
+
+      Command: #{command}
+      Arguments: #{arguments}
+      Comment ID: #{comment_id}
+
+      Comment body:
+
+      ```text
+      #{body}
+      ```
+
+      Handle this explicit command according to the workflow contract. Ordinary Linear comments remain discussion only.
+      """
+  end
+
+  defp append_comment_command_context(prompt, _context), do: prompt
 end

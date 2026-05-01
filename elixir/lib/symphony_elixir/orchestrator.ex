@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workflow, Workspace}
+  alias SymphonyElixir.Linear.CommentCommand
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -27,6 +28,8 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @type t :: %__MODULE__{}
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -37,6 +40,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      seen_comment_command_ids: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -220,10 +224,20 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+    with :ok <- Config.validate!() do
+      state = maybe_process_comment_commands(state)
+
+      with {:ok, issues} <- Tracker.fetch_candidate_issues(),
+           true <- available_slots(state) > 0 do
+        choose_issues(issues, state)
+      else
+        {:error, reason} ->
+          Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+          state
+
+        false ->
+          state
+      end
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -258,14 +272,13 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, {:workflow_parse_error, reason}} ->
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
         state
-
-      {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
-        state
     end
+  end
+
+  @doc false
+  @spec process_comment_commands_for_test([map()], State.t(), keyword()) :: State.t()
+  def process_comment_commands_for_test(entries, %State{} = state, opts \\ []) when is_list(entries) do
+    process_comment_command_entries(entries, state, opts)
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -639,6 +652,8 @@ defmodule SymphonyElixir.Orchestrator do
     String.downcase(String.trim(state_name))
   end
 
+  defp normalize_issue_state(_state_name), do: ""
+
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
@@ -686,9 +701,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, run_opts \\ []) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           agent_runner_module().run(issue, recipient, Keyword.merge([attempt: attempt, worker_host: worker_host], run_opts))
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -893,6 +908,190 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp maybe_process_comment_commands(%State{} = state) do
+    if Config.settings!().comment_commands.enabled do
+      case Tracker.fetch_recent_issue_comments() do
+        {:ok, entries} ->
+          process_comment_command_entries(entries, state)
+
+        {:error, reason} ->
+          Logger.warning("Skipping Linear comment command poll: #{inspect(reason)}")
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp process_comment_command_entries(entries, %State{} = state, opts \\ []) when is_list(entries) do
+    entries
+    |> Enum.sort_by(&comment_entry_sort_key/1)
+    |> Enum.reduce(state, fn entry, state_acc ->
+      process_comment_command_entry(entry, state_acc, opts)
+    end)
+  end
+
+  defp process_comment_command_entry(%{issue: %Issue{} = issue, comment: comment}, %State{} = state, opts)
+       when is_map(comment) do
+    comment_id = Map.get(comment, :id) || Map.get(comment, "id")
+
+    cond do
+      !is_binary(comment_id) ->
+        state
+
+      MapSet.member?(state.seen_comment_command_ids, comment_id) ->
+        state
+
+      true ->
+        case CommentCommand.parse(issue, comment) do
+          {:ok, %CommentCommand{} = command} ->
+            handle_comment_command(command, state, opts)
+
+          :ignore ->
+            state
+
+          {:error, reason} ->
+            Logger.warning("Ignoring malformed Linear comment command comment_id=#{comment_id}: #{inspect(reason)}")
+            mark_comment_command_seen(state, comment_id)
+        end
+    end
+  end
+
+  defp process_comment_command_entry(_entry, state, _opts), do: state
+
+  defp mark_comment_command_seen(%State{} = state, comment_id) when is_binary(comment_id) do
+    %{state | seen_comment_command_ids: MapSet.put(state.seen_comment_command_ids, comment_id)}
+  end
+
+  defp handle_comment_command(%CommentCommand{route: :approve_plan} = command, state, _opts) do
+    body = """
+    Acknowledged `#{command.command}` from comment `#{command.comment_id}`.
+
+    This records plan approval and recommends human promotion when appropriate, but Symphony will not move the issue to `Todo` automatically.
+    """
+
+    case Tracker.create_comment(command.issue.id, body) do
+      :ok ->
+        Logger.info("Acknowledged Linear comment command #{command.command} for #{issue_context(command.issue)}")
+
+      {:error, reason} ->
+        Logger.warning("Failed to acknowledge Linear comment command #{command.command} for #{issue_context(command.issue)}: #{inspect(reason)}")
+    end
+
+    mark_comment_command_seen(state, command.comment_id)
+  end
+
+  defp handle_comment_command(%CommentCommand{route: :rework_pr} = command, state, opts) do
+    if normalize_issue_state(command.issue.state) == "in review" do
+      dispatch_comment_command_agent(command, state, [comment_command_context: command_context(command)], opts)
+    else
+      body = """
+      Ignored `#{command.command}` from comment `#{command.comment_id}` because the issue is currently `#{command.issue.state}`.
+
+      `/rework-pr` only routes issues that are already in `In Review`, so review revisions continue on the existing draft PR branch instead of opening a second PR.
+      """
+
+      _ = Tracker.create_comment(command.issue.id, body)
+      mark_comment_command_seen(state, command.comment_id)
+    end
+  end
+
+  defp handle_comment_command(%CommentCommand{route: :planner} = command, state, opts) do
+    case planner_prompt_template() do
+      {:ok, prompt_template} ->
+        dispatch_comment_command_agent(
+          command,
+          state,
+          [
+            prompt_template: prompt_template,
+            comment_command_context: command_context(command)
+          ],
+          opts
+        )
+
+      {:error, reason} ->
+        Logger.warning("Failed to load planner workflow for #{command.command}: #{inspect(reason)}")
+        mark_comment_command_seen(state, command.comment_id)
+    end
+  end
+
+  defp dispatch_comment_command_agent(%CommentCommand{} = command, %State{} = state, run_opts, opts) do
+    if comment_command_agent_dispatch_available?(command.issue, state) do
+      dispatch_fun = Keyword.get(opts, :dispatch_fun, &dispatch_comment_command_agent/3)
+      dispatch_fun.(command.issue, mark_comment_command_seen(state, command.comment_id), run_opts)
+    else
+      state
+    end
+  end
+
+  defp comment_command_agent_dispatch_available?(%Issue{} = issue, %State{} = state) do
+    cond do
+      MapSet.member?(state.claimed, issue.id) or Map.has_key?(state.running, issue.id) ->
+        Logger.info("Skipping Linear comment command dispatch for already claimed #{issue_context(issue)}")
+        false
+
+      not dispatch_slots_available?(issue, state) ->
+        Logger.info("Skipping Linear comment command dispatch for #{issue_context(issue)} because no agent slot is available")
+        false
+
+      not worker_slots_available?(state) ->
+        Logger.info("Skipping Linear comment command dispatch for #{issue_context(issue)} because no worker slot is available")
+        false
+
+      true ->
+        true
+    end
+  end
+
+  defp dispatch_comment_command_agent(%Issue{} = issue, %State{} = state, run_opts) do
+    cond do
+      MapSet.member?(state.claimed, issue.id) or Map.has_key?(state.running, issue.id) ->
+        Logger.info("Skipping Linear comment command dispatch for already claimed #{issue_context(issue)}")
+        state
+
+      not dispatch_slots_available?(issue, state) ->
+        Logger.info("Skipping Linear comment command dispatch for #{issue_context(issue)} because no agent slot is available")
+        state
+
+      not worker_slots_available?(state) ->
+        Logger.info("Skipping Linear comment command dispatch for #{issue_context(issue)} because no worker slot is available")
+        state
+
+      true ->
+        spawn_issue_on_worker_host(state, issue, nil, self(), select_worker_host(state, nil), run_opts)
+    end
+  end
+
+  defp planner_prompt_template do
+    configured_path = Config.settings!().comment_commands.planner_workflow_file
+    workflow_dir = Workflow.workflow_file_path() |> Path.dirname()
+    path = if Path.type(configured_path) == :absolute, do: configured_path, else: Path.join(workflow_dir, configured_path)
+
+    case Workflow.load(path) do
+      {:ok, %{prompt_template: prompt_template}} -> {:ok, prompt_template}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp command_context(%CommentCommand{} = command) do
+    %{
+      command: command.command,
+      arguments: command.arguments,
+      comment_id: command.comment_id,
+      body: command.body
+    }
+  end
+
+  defp comment_entry_sort_key(%{comment: %{created_at: %DateTime{} = created_at}}) do
+    DateTime.to_unix(created_at, :microsecond)
+  end
+
+  defp comment_entry_sort_key(%{"comment" => %{"created_at" => %DateTime{} = created_at}}) do
+    DateTime.to_unix(created_at, :microsecond)
+  end
+
+  defp comment_entry_sort_key(_entry), do: 9_223_372_036_854_775_807
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
@@ -1053,6 +1252,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
+  end
+
+  defp agent_runner_module do
+    Application.get_env(:symphony_elixir, :agent_runner_module, AgentRunner)
   end
 
   defp available_slots(%State{} = state) do

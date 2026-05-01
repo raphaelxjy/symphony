@@ -83,6 +83,26 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule CommentCommands do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:comment_limit, :integer, default: 20)
+      field(:planner_workflow_file, :string, default: "WORKFLOW_PLANNER.md")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :comment_limit, :planner_workflow_file], empty_values: [])
+      |> validate_number(:comment_limit, greater_than: 0)
+    end
+  end
+
   defmodule Workspace do
     @moduledoc false
     use Ecto.Schema
@@ -264,6 +284,7 @@ defmodule SymphonyElixir.Config.Schema do
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:comment_commands, CommentCommands, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
@@ -356,6 +377,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast(attrs, [])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
+    |> cast_embed(:comment_commands, with: &CommentCommands.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
