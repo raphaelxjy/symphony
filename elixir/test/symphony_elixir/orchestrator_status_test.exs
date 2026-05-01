@@ -99,6 +99,86 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+
+    assert [
+             %{event: :session_started, timestamp: ^now},
+             %{
+               event: :notification,
+               timestamp: ^now,
+               message: %{
+                 event: :notification,
+                 message: %{method: "some-event"},
+                 timestamp: ^now
+               }
+             }
+           ] = snapshot_entry.recent_events
+  end
+
+  test "orchestrator snapshot caps recent codex event history" do
+    issue_id = "issue-history-limit"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-189",
+      title: "History limit test",
+      description: "Capture bounded codex history",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-189"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :HistoryLimitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    state_with_issue =
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+
+    :sys.replace_state(pid, fn _ -> state_with_issue end)
+
+    for index <- 1..25 do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :"notification_#{index}",
+           payload: %{index: index},
+           timestamp: DateTime.add(~U[2026-05-01 00:00:00Z], index, :second)
+         }}
+      )
+    end
+
+    snapshot =
+      wait_for_snapshot(pid, fn
+        %{running: [%{recent_events: events}]} -> length(events) == 20
+        _ -> false
+      end)
+
+    assert %{running: [snapshot_entry]} = snapshot
+    assert length(snapshot_entry.recent_events) == 20
+    assert List.first(snapshot_entry.recent_events).event == :notification_6
+    assert List.last(snapshot_entry.recent_events).event == :notification_25
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

@@ -96,6 +96,10 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(_running, _retry), do: "running"
 
   defp running_entry_payload(entry) do
+    recent_events = recent_events_payload(entry)
+    last_message = summarize_message(entry.last_codex_message)
+    last_event_at = iso8601(entry.last_codex_timestamp)
+
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
@@ -105,9 +109,13 @@ defmodule SymphonyElixirWeb.Presenter do
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
-      last_message: summarize_message(entry.last_codex_message),
+      last_message: last_message,
       started_at: iso8601(entry.started_at),
-      last_event_at: iso8601(entry.last_codex_timestamp),
+      last_event_at: last_event_at,
+      last_activity_at: last_event_at,
+      current_activity: last_message,
+      blocked_on: latest_blocker(recent_events),
+      recent_events: recent_events,
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
@@ -129,6 +137,10 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp running_issue_payload(running) do
+    recent_events = recent_events_payload(running)
+    last_message = summarize_message(running.last_codex_message)
+    last_event_at = iso8601(running.last_codex_timestamp)
+
     %{
       worker_host: Map.get(running, :worker_host),
       workspace_path: Map.get(running, :workspace_path),
@@ -137,8 +149,12 @@ defmodule SymphonyElixirWeb.Presenter do
       state: running.state,
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
-      last_message: summarize_message(running.last_codex_message),
-      last_event_at: iso8601(running.last_codex_timestamp),
+      last_message: last_message,
+      last_event_at: last_event_at,
+      last_activity_at: last_event_at,
+      current_activity: last_message,
+      blocked_on: latest_blocker(recent_events),
+      recent_events: recent_events,
       tokens: %{
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
@@ -168,14 +184,65 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp recent_events_payload(running) do
-    [
-      %{
-        at: iso8601(running.last_codex_timestamp),
-        event: running.last_codex_event,
-        message: summarize_message(running.last_codex_message)
-      }
-    ]
+    running
+    |> Map.get(:recent_events, [])
+    |> case do
+      events when is_list(events) and events != [] ->
+        Enum.map(events, &recent_event_payload/1)
+
+      _ ->
+        [
+          %{
+            timestamp: running.last_codex_timestamp,
+            event: running.last_codex_event,
+            message: running.last_codex_message
+          }
+        ]
+        |> Enum.map(&recent_event_payload/1)
+    end
     |> Enum.reject(&is_nil(&1.at))
+  end
+
+  defp recent_event_payload(%{timestamp: timestamp, event: event, message: message}) do
+    humanized = summarize_message(message)
+
+    %{
+      at: iso8601(timestamp),
+      event: event,
+      message: humanized,
+      blocked_on: classify_blocker(event, message)
+    }
+  end
+
+  defp recent_event_payload(_event), do: %{at: nil, event: nil, message: nil, blocked_on: nil}
+
+  defp latest_blocker(events) when is_list(events) do
+    events
+    |> Enum.reverse()
+    |> Enum.find_value(& &1.blocked_on)
+  end
+
+  defp latest_blocker(_events), do: nil
+
+  defp classify_blocker(event, message) do
+    event_text = event |> to_string() |> String.downcase()
+    message_text = message |> inspect(limit: 50, printable_limit: 500) |> String.downcase()
+
+    cond do
+      String.contains?(event_text, ["auto_approved", "auto_answered"]) ->
+        nil
+
+      String.contains?(event_text, ["approval_required"]) or
+          String.contains?(message_text, ["approval_required", "requestapproval"]) ->
+        "approval"
+
+      String.contains?(event_text, ["input_required", "needs_input"]) or
+          String.contains?(message_text, ["turn_input_required", "input_required", "requestuserinput"]) ->
+        "user_input"
+
+      true ->
+        nil
+    end
   end
 
   defp summarize_message(nil), do: nil
