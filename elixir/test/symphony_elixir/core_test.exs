@@ -590,6 +590,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
+    refute Map.has_key?(state.blocked_failures, issue_id)
     assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
@@ -629,7 +630,131 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
+    refute Map.has_key?(state.blocked_failures, issue_id)
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+  end
+
+  test "mcp elicitation failure blocks without scheduling retry" do
+    issue_id = "issue-mcp-blocked"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :McpBlockedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "HIN-24",
+      issue: %Issue{id: issue_id, identifier: "HIN-24", state: "In Progress"},
+      workspace_path: "/tmp/symphony-workspaces/HIN-24",
+      session_id: "thread-hin24-turn-1",
+      codex_input_tokens: 100,
+      codex_output_tokens: 25,
+      codex_total_tokens: 125,
+      turn_count: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    payload = %{
+      "method" => "mcpServer/elicitation/request",
+      "params" => %{
+        "_meta" => %{
+          "tool_title" => "create_pull_request",
+          "tool_params" => %{"head_branch" => "codex/HIN-24-v01-opening-subset"}
+        }
+      }
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:blocked_failures, %{})
+    end)
+
+    send(pid, {:agent_run_failed, issue_id, {:turn_input_required, payload}})
+    send(pid, {:DOWN, ref, :process, self(), :blocked})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             blocked_on: "mcp_elicitation",
+             error: error,
+             workspace_path: "/tmp/symphony-workspaces/HIN-24",
+             session_id: "thread-hin24-turn-1",
+             codex_total_tokens: 125
+           } = state.blocked_failures[issue_id]
+
+    assert error =~ "mcpServer/elicitation/request"
+    assert error =~ "create_pull_request"
+  end
+
+  test "approval failure blocks without scheduling retry" do
+    issue_id = "issue-approval-blocked"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ApprovalBlockedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "HIN-6",
+      issue: %Issue{id: issue_id, identifier: "HIN-6", state: "In Progress"},
+      workspace_path: "/tmp/symphony-workspaces/HIN-6",
+      session_id: "thread-hin6-turn-1",
+      codex_input_tokens: 10,
+      codex_output_tokens: 2,
+      codex_total_tokens: 12,
+      turn_count: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:blocked_failures, %{})
+    end)
+
+    send(pid, {:agent_run_failed, issue_id, {:approval_required, %{"method" => "item/commandExecution/requestApproval"}}})
+    send(pid, {:DOWN, ref, :process, self(), :blocked})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             blocked_on: "approval",
+             error: error,
+             workspace_path: "/tmp/symphony-workspaces/HIN-6",
+             session_id: "thread-hin6-turn-1"
+           } = state.blocked_failures[issue_id]
+
+    assert error =~ "approval_required"
+    assert error =~ "item/commandExecution/requestApproval"
   end
 
   test "stale retry timer messages do not consume newer retry entries" do

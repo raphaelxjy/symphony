@@ -22,6 +22,7 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
+        send_agent_failure(codex_update_recipient, issue, reason)
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
@@ -76,6 +77,14 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+
+  defp send_agent_failure(recipient, %Issue{id: issue_id}, reason)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(recipient, {:agent_run_failed, issue_id, reason})
+    :ok
+  end
+
+  defp send_agent_failure(_recipient, _issue, _reason), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)

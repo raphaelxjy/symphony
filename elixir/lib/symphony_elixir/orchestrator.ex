@@ -42,6 +42,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       seen_comment_command_ids: MapSet.new(),
       retry_attempts: %{},
+      blocked_failures: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -144,16 +145,7 @@ defmodule SymphonyElixir.Orchestrator do
               |> release_issue_claim(issue_id)
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_abnormal_agent_exit(state, issue_id, running_entry, reason, session_id)
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -202,6 +194,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+
+  def handle_info({:agent_run_failed, issue_id, reason}, %{running: running} = state)
+      when is_binary(issue_id) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry = Map.put(running_entry, :failure_reason, reason)
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
@@ -445,7 +449,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            blocked_failures: Map.delete(state.blocked_failures, issue_id)
         }
 
       _ ->
@@ -738,7 +743,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            blocked_failures: Map.delete(state.blocked_failures, issue.id)
         }
 
       {:error, reason} ->
@@ -777,7 +783,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        blocked_failures: Map.delete(state.blocked_failures, issue_id)
     }
   end
 
@@ -1112,8 +1119,114 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_abnormal_agent_exit(state, issue_id, running_entry, reason, session_id) do
+    case non_retryable_blocker_for_failure(running_entry, reason) do
+      nil ->
+        retry_abnormal_agent_exit(state, issue_id, running_entry, reason, session_id)
+
+      blocked_on ->
+        block_abnormal_agent_exit(state, issue_id, running_entry, reason, session_id, blocked_on)
+    end
+  end
+
+  defp retry_abnormal_agent_exit(state, issue_id, running_entry, reason, session_id) do
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+    schedule_issue_retry(state, issue_id, next_retry_attempt_from_running(running_entry), %{
+      identifier: running_entry.identifier,
+      error: "agent exited: #{inspect(reason)}",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
+  defp block_abnormal_agent_exit(state, issue_id, running_entry, reason, session_id, blocked_on) do
+    Logger.warning("Agent task blocked for issue_id=#{issue_id} session_id=#{session_id} blocked_on=#{blocked_on} reason=#{inspect(agent_failure_reason(running_entry, reason))}")
+
+    block_issue_failure(state, issue_id, running_entry, reason, blocked_on)
+  end
+
+  defp block_issue_failure(%State{} = state, issue_id, running_entry, down_reason, blocked_on)
+       when is_binary(issue_id) and is_binary(blocked_on) and is_map(running_entry) do
+    failure_reason = agent_failure_reason(running_entry, down_reason)
+
+    blocked_entry = %{
+      identifier: Map.get(running_entry, :identifier),
+      state: get_in(running_entry, [:issue, Access.key(:state)]),
+      issue: Map.get(running_entry, :issue),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      session_id: Map.get(running_entry, :session_id),
+      codex_app_server_pid: Map.get(running_entry, :codex_app_server_pid),
+      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      started_at: Map.get(running_entry, :started_at),
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      last_codex_message: Map.get(running_entry, :last_codex_message),
+      last_codex_event: Map.get(running_entry, :last_codex_event),
+      recent_events: Map.get(running_entry, :codex_event_history, []),
+      blocked_on: blocked_on,
+      error: failure_error_text(failure_reason),
+      failed_at: DateTime.utc_now()
+    }
+
+    %{
+      state
+      | blocked_failures: Map.put(state.blocked_failures, issue_id, blocked_entry),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.put(state.claimed, issue_id)
+    }
+  end
+
+  defp non_retryable_blocker_for_failure(running_entry, down_reason) when is_map(running_entry) do
+    running_entry
+    |> agent_failure_reason(down_reason)
+    |> classify_non_retryable_failure()
+  end
+
+  defp agent_failure_reason(running_entry, down_reason) when is_map(running_entry) do
+    Map.get(running_entry, :failure_reason) || down_reason
+  end
+
+  defp classify_non_retryable_failure({:approval_required, _payload}), do: "approval"
+
+  defp classify_non_retryable_failure({:turn_input_required, payload}) do
+    if mcp_elicitation_payload?(payload), do: "mcp_elicitation", else: "user_input"
+  end
+
+  defp classify_non_retryable_failure(reason) do
+    reason_text =
+      reason
+      |> failure_error_text()
+      |> String.downcase()
+
+    cond do
+      String.contains?(reason_text, "mcpserver/elicitation/request") ->
+        "mcp_elicitation"
+
+      String.contains?(reason_text, "approval_required") or String.contains?(reason_text, "requestapproval") ->
+        "approval"
+
+      String.contains?(reason_text, "turn_input_required") or String.contains?(reason_text, "input_required") ->
+        "user_input"
+
+      true ->
+        nil
+    end
+  end
+
+  defp mcp_elicitation_payload?(%{"method" => "mcpServer/elicitation/request"}), do: true
+  defp mcp_elicitation_payload?(%{method: "mcpServer/elicitation/request"}), do: true
+  defp mcp_elicitation_payload?(_payload), do: false
+
+  defp failure_error_text(reason) do
+    inspect(reason, limit: :infinity, printable_limit: :infinity)
+  end
+
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    %{state | claimed: MapSet.delete(state.claimed, issue_id), blocked_failures: Map.delete(state.blocked_failures, issue_id)}
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -1336,10 +1449,17 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    blocked =
+      state.blocked_failures
+      |> Enum.map(fn {issue_id, blocked_entry} ->
+        Map.put(blocked_entry, :issue_id, issue_id)
+      end)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
+       blocked: blocked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
