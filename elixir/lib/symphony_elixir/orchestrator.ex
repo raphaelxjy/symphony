@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @codex_event_history_limit 20
+  @comment_command_marker_heading "Symphony command marker"
+  @comment_command_marker_status "claimed"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -40,7 +42,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
-      seen_comment_command_ids: MapSet.new(),
+      comment_command_debounce_ids: MapSet.new(),
       retry_attempts: %{},
       blocked_failures: %{},
       codex_totals: nil,
@@ -371,6 +373,11 @@ defmodule SymphonyElixir.Orchestrator do
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
+      running_issue_continuation_state?(state, issue) ->
+        Logger.debug("Issue remains in command continuation state: #{issue_context(issue)} state=#{issue.state}; keeping active agent")
+
+        refresh_running_issue_state(state, issue)
+
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
@@ -379,6 +386,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp running_issue_continuation_state?(%State{running: running}, %Issue{id: issue_id, state: state_name})
+       when is_binary(issue_id) and is_binary(state_name) and is_map(running) do
+    running
+    |> Map.get(issue_id, %{})
+    |> Map.get(:continuation_states, [])
+    |> List.wrap()
+    |> Enum.any?(fn continuation_state -> normalize_issue_state(continuation_state) == normalize_issue_state(state_name) end)
+  end
+
+  defp running_issue_continuation_state?(_state, _issue), do: false
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -728,6 +746,8 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_event: nil,
             codex_event_history: [],
             codex_app_server_pid: nil,
+            continuation_states: Keyword.get(run_opts, :continuation_states, []),
+            comment_command_context: Keyword.get(run_opts, :comment_command_context),
             codex_input_tokens: 0,
             codex_output_tokens: 0,
             codex_total_tokens: 0,
@@ -930,6 +950,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp process_comment_command_entries(entries, %State{} = state, opts \\ []) when is_list(entries) do
+    durable_marker_ids = comment_command_marker_ids(entries)
+    opts = Keyword.put(opts, :comment_command_marker_ids, durable_marker_ids)
+
     entries
     |> Enum.sort_by(&comment_entry_sort_key/1)
     |> Enum.reduce(state, fn entry, state_acc ->
@@ -945,7 +968,10 @@ defmodule SymphonyElixir.Orchestrator do
       !is_binary(comment_id) ->
         state
 
-      MapSet.member?(state.seen_comment_command_ids, comment_id) ->
+      MapSet.member?(state.comment_command_debounce_ids, comment_id) ->
+        state
+
+      durable_comment_command_marker?(comment_id, opts) ->
         state
 
       true ->
@@ -961,31 +987,35 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp process_comment_command_entry(_entry, state, _opts), do: state
 
-  defp mark_comment_command_seen(%State{} = state, comment_id) when is_binary(comment_id) do
-    %{state | seen_comment_command_ids: MapSet.put(state.seen_comment_command_ids, comment_id)}
+  defp mark_comment_command_debounced(%State{} = state, comment_id) when is_binary(comment_id) do
+    %{state | comment_command_debounce_ids: MapSet.put(state.comment_command_debounce_ids, comment_id)}
   end
 
-  defp handle_comment_command(%CommentCommand{route: :approve_plan} = command, state, _opts) do
+  defp handle_comment_command(%CommentCommand{route: :approve_plan} = command, state, opts) do
     body = """
     Acknowledged `#{command.command}` from comment `#{command.comment_id}`.
 
     This records plan approval and recommends human promotion when appropriate, but Symphony will not move the issue to `Todo` automatically.
     """
 
-    case Tracker.create_comment(command.issue.id, body) do
-      :ok ->
-        Logger.info("Acknowledged Linear comment command #{command.command} for #{issue_context(command.issue)}")
+    with {:ok, state} <- claim_comment_command(command, state, opts),
+         :ok <- Tracker.create_comment(command.issue.id, body) do
+      Logger.info("Acknowledged Linear comment command #{command.command} for #{issue_context(command.issue)}")
+      state
+    else
+      {:error, {:comment_command_marker_failed, reason}} ->
+        Logger.warning("Failed to claim Linear comment command #{command.command} for #{issue_context(command.issue)}: #{inspect(reason)}")
+        state
 
       {:error, reason} ->
         Logger.warning("Failed to acknowledge Linear comment command #{command.command} for #{issue_context(command.issue)}: #{inspect(reason)}")
+        state
     end
-
-    mark_comment_command_seen(state, command.comment_id)
   end
 
   defp handle_comment_command(%CommentCommand{route: :rework_pr} = command, state, opts) do
     if normalize_issue_state(command.issue.state) == "in review" do
-      dispatch_comment_command_agent(command, state, [comment_command_context: command_context(command)], opts)
+      dispatch_comment_command_agent(command, state, comment_command_run_opts(command), opts)
     else
       body = """
       Ignored `#{command.command}` from comment `#{command.comment_id}` because the issue is currently `#{command.issue.state}`.
@@ -993,36 +1023,165 @@ defmodule SymphonyElixir.Orchestrator do
       `/rework-pr` only routes issues that are already in `In Review`, so review revisions continue on the existing draft PR branch instead of opening a second PR.
       """
 
-      _ = Tracker.create_comment(command.issue.id, body)
-      mark_comment_command_seen(state, command.comment_id)
+      with {:ok, state} <- claim_comment_command(command, state, opts),
+           :ok <- Tracker.create_comment(command.issue.id, body) do
+        state
+      else
+        {:error, {:comment_command_marker_failed, reason}} ->
+          Logger.warning("Failed to claim Linear comment command #{command.command} for #{issue_context(command.issue)}: #{inspect(reason)}")
+          state
+
+        {:error, reason} ->
+          Logger.warning("Failed to record ignored Linear comment command #{command.command} for #{issue_context(command.issue)}: #{inspect(reason)}")
+          state
+      end
     end
   end
 
   defp handle_comment_command(%CommentCommand{route: :planner} = command, state, opts) do
-    case planner_prompt_template() do
-      {:ok, prompt_template} ->
-        dispatch_comment_command_agent(
-          command,
-          state,
-          [
-            prompt_template: prompt_template,
-            comment_command_context: command_context(command)
-          ],
-          opts
-        )
+    if terminal_issue_state?(command.issue.state, terminal_state_set()) do
+      state
+    else
+      case planner_prompt_template() do
+        {:ok, prompt_template} ->
+          dispatch_comment_command_agent(
+            command,
+            state,
+            comment_command_run_opts(command, prompt_template: prompt_template),
+            opts
+          )
 
-      {:error, reason} ->
-        Logger.warning("Failed to load planner workflow for #{command.command}: #{inspect(reason)}")
-        mark_comment_command_seen(state, command.comment_id)
+        {:error, reason} ->
+          Logger.warning("Failed to load planner workflow for #{command.command}: #{inspect(reason)}")
+          state
+      end
     end
   end
 
-  defp dispatch_comment_command_agent(%CommentCommand{} = command, %State{} = state, run_opts, opts) do
-    if comment_command_agent_dispatch_available?(command.issue, state) do
-      dispatch_fun = Keyword.get(opts, :dispatch_fun, &dispatch_comment_command_agent/3)
-      dispatch_fun.(command.issue, mark_comment_command_seen(state, command.comment_id), run_opts)
+  defp comment_command_run_opts(%CommentCommand{} = command, extra_opts \\ []) do
+    [
+      comment_command_context: command_context(command),
+      continuation_states: command_continuation_states(command),
+      max_turns: max(Config.settings!().agent.max_turns, 2)
+    ]
+    |> Keyword.merge(extra_opts)
+  end
+
+  defp command_continuation_states(%CommentCommand{issue: %Issue{state: state}}) when is_binary(state) do
+    [state]
+  end
+
+  defp command_continuation_states(_command), do: []
+
+  defp claim_comment_command(%CommentCommand{} = command, %State{} = state, opts) do
+    cond do
+      MapSet.member?(state.comment_command_debounce_ids, command.comment_id) ->
+        {:ok, state}
+
+      durable_comment_command_marker?(command.comment_id, opts) ->
+        {:ok, mark_comment_command_debounced(state, command.comment_id)}
+
+      true ->
+        case Tracker.create_comment(command.issue.id, command_marker_body(command)) do
+          :ok ->
+            {:ok, mark_comment_command_debounced(state, command.comment_id)}
+
+          {:error, reason} ->
+            {:error, {:comment_command_marker_failed, reason}}
+        end
+    end
+  end
+
+  defp command_marker_body(%CommentCommand{} = command) do
+    """
+    #{@comment_command_marker_heading}
+    command_comment_id: #{command.comment_id}
+    command: #{command.command}
+    status: #{@comment_command_marker_status}
+    """
+  end
+
+  defp durable_comment_command_marker?(comment_id, opts) when is_binary(comment_id) do
+    opts
+    |> Keyword.get(:comment_command_marker_ids, MapSet.new())
+    |> MapSet.member?(comment_id)
+  end
+
+  defp durable_comment_command_marker?(_comment_id, _opts), do: false
+
+  defp comment_command_marker_ids(entries) when is_list(entries) do
+    entries
+    |> Enum.flat_map(fn
+      %{comment: comment} -> [comment]
+      %{"comment" => comment} -> [comment]
+      _entry -> []
+    end)
+    |> Enum.map(&comment_command_marker_id/1)
+    |> Enum.reject(&is_nil/1)
+    |> MapSet.new()
+  end
+
+  defp comment_command_marker_ids(_entries), do: MapSet.new()
+
+  defp comment_command_marker_id(comment) when is_map(comment) do
+    body = Map.get(comment, :body) || Map.get(comment, "body")
+
+    with {:ok, first_line} <- first_non_blank_comment_line(body),
+         true <- first_line == @comment_command_marker_heading do
+      command_marker_field(body, "command_comment_id")
     else
-      state
+      _ -> nil
+    end
+  end
+
+  defp comment_command_marker_id(_comment), do: nil
+
+  defp first_non_blank_comment_line(body) when is_binary(body) do
+    body
+    |> String.split(~r/\R/, trim: false)
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&(&1 != ""))
+    |> case do
+      nil -> :error
+      line -> {:ok, line}
+    end
+  end
+
+  defp first_non_blank_comment_line(_body), do: :error
+
+  defp command_marker_field(body, field_name) when is_binary(body) and is_binary(field_name) do
+    prefix = field_name <> ":"
+
+    body
+    |> String.split(~r/\R/, trim: false)
+    |> Enum.map(&String.trim/1)
+    |> Enum.find_value(fn line ->
+      if String.starts_with?(line, prefix) do
+        line
+        |> String.replace_prefix(prefix, "")
+        |> String.trim()
+        |> empty_string_to_nil()
+      end
+    end)
+  end
+
+  defp command_marker_field(_body, _field_name), do: nil
+
+  defp empty_string_to_nil(""), do: nil
+  defp empty_string_to_nil(value), do: value
+
+  defp dispatch_comment_command_agent(%CommentCommand{} = command, %State{} = state, run_opts, opts) do
+    with true <- comment_command_agent_dispatch_available?(command.issue, state),
+         {:ok, state} <- claim_comment_command(command, state, opts) do
+      dispatch_fun = Keyword.get(opts, :dispatch_fun, &dispatch_comment_command_agent/3)
+      dispatch_fun.(command.issue, state, run_opts)
+    else
+      false ->
+        state
+
+      {:error, {:comment_command_marker_failed, reason}} ->
+        Logger.warning("Failed to claim Linear comment command #{command.command} for #{issue_context(command.issue)}: #{inspect(reason)}")
+        state
     end
   end
 

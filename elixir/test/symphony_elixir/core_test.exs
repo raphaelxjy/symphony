@@ -287,6 +287,57 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "command continuation state keeps running agent even when not ordinarily active" do
+    issue_id = "issue-command-continuation"
+    issue_identifier = "MT-560"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "In Review", identifier: issue_identifier},
+          continuation_states: ["In Review"],
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "In Review",
+      title: "Review command",
+      description: "Explicit command run",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+    assert updated_state.running[issue_id].issue.state == "In Review"
+
+    send(agent_pid, :stop)
+  end
+
   test "terminal issue state stops running agent and cleans workspace" do
     test_root =
       Path.join(
@@ -957,6 +1008,37 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Arguments: current board"
     assert prompt =~ "Comment ID: comment-3"
     assert prompt =~ "/roadmap-review current board"
+    assert prompt =~ "Command detection and dispatch are not completion."
+    assert prompt =~ "durable artifact for `/roadmap-review`"
+    assert prompt =~ "older supervised-only or one-turn comment-command limitations"
+    assert prompt =~ "controlling instruction"
+  end
+
+  test "prompt builder tells rework commands to revise instead of only review" do
+    issue = %Issue{
+      identifier: "S-4",
+      title: "Handle rework",
+      description: "Render rework context",
+      state: "In Review",
+      url: "https://example.org/issues/S-4",
+      labels: []
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        prompt_template: "Ticket {{ issue.identifier }}",
+        comment_command_context: %{
+          "command" => "/rework-pr",
+          "arguments" => "",
+          "comment_id" => "comment-4",
+          "body" => "/rework-pr\n\nPlease apply this correction."
+        }
+      )
+
+    assert prompt =~ "This is a review-rework command"
+    assert prompt =~ "not a request to perform a read-only code review"
+    assert prompt =~ "Apply the requested scoped revision"
+    assert prompt =~ "leave a fresh Linear handoff"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
@@ -1629,6 +1711,119 @@ defmodule SymphonyElixir.CoreTest do
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner can continue command rework runs while issue remains in review" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-rework-continuation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-rework"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-rework-1"}}}'
+            printf '%s\\n' '{"method":"item/completed","params":{"item":{"id":"msg-rework-1","type":"agentMessage"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-rework-2"}}}'
+            printf '%s\\n' '{"method":"item/completed","params":{"item":{"id":"msg-rework-2","type":"agentMessage"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 1
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-rework",
+             identifier: "MT-249",
+             title: "Rework review",
+             description: "Still in review",
+             state: "In Review"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-rework",
+        identifier: "MT-249",
+        title: "Rework review",
+        description: "Review request",
+        state: "In Review",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 continuation_states: ["In Review"],
+                 comment_command_context: %{
+                   command: "/rework-pr",
+                   arguments: "fix docs",
+                   comment_id: "comment-rework",
+                   body: "/rework-pr fix docs"
+                 }
+               )
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+
+      assert trace =~ "do not treat command detection or dispatch itself as success"
+      assert trace =~ "pushed PR update"
+      assert trace =~ "Linear handoff/comment"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
