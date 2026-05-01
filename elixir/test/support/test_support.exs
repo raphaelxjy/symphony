@@ -42,7 +42,9 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_issue_comments)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :agent_runner_module)
           File.rm_rf(workflow_root)
         end)
 
@@ -100,6 +102,9 @@ defmodule SymphonyElixir.TestSupport do
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
+          comment_commands_enabled: false,
+          comment_commands_comment_limit: 20,
+          comment_commands_planner_workflow_file: "WORKFLOW_PLANNER.md",
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
@@ -137,6 +142,9 @@ defmodule SymphonyElixir.TestSupport do
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
+    comment_commands_enabled = Keyword.get(config, :comment_commands_enabled)
+    comment_commands_comment_limit = Keyword.get(config, :comment_commands_comment_limit)
+    comment_commands_planner_workflow_file = Keyword.get(config, :comment_commands_planner_workflow_file)
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
@@ -176,6 +184,10 @@ defmodule SymphonyElixir.TestSupport do
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
+        "comment_commands:",
+        "  enabled: #{yaml_value(comment_commands_enabled)}",
+        "  comment_limit: #{yaml_value(comment_commands_comment_limit)}",
+        "  planner_workflow_file: #{yaml_value(comment_commands_planner_workflow_file)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),

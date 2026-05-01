@@ -95,6 +95,59 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_query """
+  query SymphonyLinearCommentCommandPoll($projectSlug: String!, $first: Int!, $relationFirst: Int!, $commentFirst: Int!, $after: String) {
+    issues(filter: {project: {slugId: {eq: $projectSlug}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        comments(last: $commentFirst) {
+          nodes {
+            id
+            body
+            createdAt
+            updatedAt
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -156,6 +209,25 @@ defmodule SymphonyElixir.Linear.Client do
       ids ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
+        end
+    end
+  end
+
+  @spec fetch_recent_issue_comments() :: {:ok, [map()]} | {:error, term()}
+  def fetch_recent_issue_comments do
+    tracker = Config.settings!().tracker
+    project_slug = tracker.project_slug
+
+    cond do
+      is_nil(tracker.api_key) ->
+        {:error, :missing_linear_api_token}
+
+      is_nil(project_slug) ->
+        {:error, :missing_linear_project_slug}
+
+      true ->
+        with {:ok, assignee_filter} <- routing_assignee_filter() do
+          do_fetch_recent_issue_comments(project_slug, assignee_filter)
         end
     end
   end
@@ -273,6 +345,37 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp do_fetch_issue_states(ids, assignee_filter) do
     do_fetch_issue_states(ids, assignee_filter, &graphql/2)
+  end
+
+  defp do_fetch_recent_issue_comments(project_slug, assignee_filter) do
+    do_fetch_recent_issue_comments_page(project_slug, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_recent_issue_comments_page(project_slug, assignee_filter, after_cursor, acc_entries) do
+    comment_limit = Config.settings!().comment_commands.comment_limit
+
+    with {:ok, body} <-
+           graphql(@comments_query, %{
+             projectSlug: project_slug,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             commentFirst: comment_limit,
+             after: after_cursor
+           }),
+         {:ok, entries, page_info} <- decode_linear_comment_page_response(body, assignee_filter) do
+      updated_acc = Enum.reverse(entries, acc_entries)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_recent_issue_comments_page(project_slug, assignee_filter, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, Enum.reverse(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
   end
 
   defp do_fetch_issue_states(ids, assignee_filter, graphql_fun)
@@ -437,6 +540,72 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
 
+  defp decode_linear_comment_page_response(
+         %{
+           "data" => %{
+             "issues" => %{
+               "nodes" => nodes,
+               "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
+             }
+           }
+         },
+         assignee_filter
+       ) do
+    {:ok, issue_comment_entries(nodes, assignee_filter), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+  end
+
+  defp decode_linear_comment_page_response(%{"errors" => errors}, _assignee_filter) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
+  defp decode_linear_comment_page_response(_unknown, _assignee_filter) do
+    {:error, :linear_unknown_payload}
+  end
+
+  defp issue_comment_entries(nodes, assignee_filter) when is_list(nodes) do
+    terminal_states = terminal_state_set()
+
+    Enum.flat_map(nodes, fn issue_node ->
+      issue = normalize_issue(issue_node, assignee_filter)
+
+      cond do
+        is_nil(issue) ->
+          []
+
+        terminal_issue_state?(issue.state, terminal_states) ->
+          []
+
+        true ->
+          issue_node
+          |> get_in(["comments", "nodes"])
+          |> normalize_comment_nodes()
+          |> Enum.map(&%{issue: issue, comment: &1})
+      end
+    end)
+  end
+
+  defp issue_comment_entries(_nodes, _assignee_filter), do: []
+
+  defp normalize_comment_nodes(nodes) when is_list(nodes) do
+    nodes
+    |> Enum.map(&normalize_comment/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_comment_nodes(_nodes), do: []
+
+  defp normalize_comment(%{"id" => id, "body" => body} = comment)
+       when is_binary(id) and is_binary(body) do
+    %{
+      id: id,
+      body: body,
+      created_at: parse_datetime(comment["createdAt"]),
+      updated_at: parse_datetime(comment["updatedAt"])
+    }
+  end
+
+  defp normalize_comment(_comment), do: nil
+
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do
     {:ok, end_cursor}
@@ -467,6 +636,19 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
+
+  defp terminal_state_set do
+    Config.settings!().tracker.terminal_states
+    |> Enum.map(&normalize_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
+
+  defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
+    MapSet.member?(terminal_states, normalize_state(state_name))
+  end
+
+  defp terminal_issue_state?(_state_name, _terminal_states), do: false
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
@@ -537,6 +719,14 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_assignee_match_value(_value), do: nil
+
+  defp normalize_state(state_name) when is_binary(state_name) do
+    state_name
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_state(_state_name), do: ""
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels

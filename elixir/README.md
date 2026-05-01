@@ -121,6 +121,11 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `comment_commands.enabled` turns on polling for explicit Linear issue comment commands. Symphony
+  checks the first non-blank line only, ignores ordinary comments, records seen command comment IDs
+  in memory for the current runner session, routes planner commands through `WORKFLOW_PLANNER.md`,
+  acknowledges `/approve-plan` without changing state, and only accepts `/rework-pr` on issues that
+  are already in review.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
