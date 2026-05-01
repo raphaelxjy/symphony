@@ -92,6 +92,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Blocked</p>
+            <p class="metric-value numeric"><%= @payload.counts.blocked %></p>
+            <p class="metric-detail">Issues stopped on non-interactive blockers.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -223,6 +229,66 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
+              <h2 class="section-title">Blocked failures</h2>
+              <p class="section-copy">Issues stopped instead of retried because operator input is required.</p>
+            </div>
+          </div>
+
+          <%= if @payload.blocked == [] do %>
+            <p class="empty-state">No issues are currently blocked.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 900px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Blocker</th>
+                    <th>Session</th>
+                    <th>Error</th>
+                    <th>Workspace</th>
+                    <th>Tokens</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.blocked}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+                    </td>
+                    <td>
+                      <span class={blocker_badge_class(entry.blocked_on)}>
+                        <%= entry.blocked_on || "unknown" %>
+                      </span>
+                    </td>
+                    <td class="mono"><%= entry.session_id || "n/a" %></td>
+                    <td>
+                      <span class="event-text" title={entry.error || "n/a"}>
+                        <%= entry.error || "n/a" %>
+                      </span>
+                    </td>
+                    <td>
+                      <span class="workspace-text" title={entry.workspace_path || "n/a"}>
+                        <%= entry.workspace_path || "n/a" %>
+                      </span>
+                    </td>
+                    <td>
+                      <div class="token-stack numeric">
+                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
               <h2 class="section-title">Retry queue</h2>
               <p class="section-copy">Issues waiting for the next retry window.</p>
             </div>
@@ -282,6 +348,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp total_runtime_seconds(payload, now) do
     completed_runtime_seconds(payload) +
       Enum.reduce(payload.running, 0, fn entry, total ->
+        total + runtime_seconds_from_started_at(entry.started_at, now)
+      end) +
+      Enum.reduce(payload.blocked, 0, fn entry, total ->
         total + runtime_seconds_from_started_at(entry.started_at, now)
       end)
   end

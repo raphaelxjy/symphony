@@ -15,10 +15,12 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
+            retrying: length(snapshot.retrying),
+            blocked: length(Map.get(snapshot, :blocked, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -37,11 +39,12 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
+        blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) do
+        if is_nil(running) and is_nil(retry) and is_nil(blocked) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, blocked)}
         end
 
       _ ->
@@ -60,40 +63,71 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry) do
+  defp issue_payload_body(issue_identifier, running, retry, blocked) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry),
-      status: issue_status(running, retry),
-      workspace: %{
-        path: workspace_path(issue_identifier, running, retry),
-        host: workspace_host(running, retry)
-      },
-      attempts: %{
-        restart_count: restart_count(retry),
-        current_retry_attempt: retry_attempt(retry)
-      },
-      running: running && running_issue_payload(running),
-      retry: retry && retry_issue_payload(retry),
+      issue_id: issue_id_from_entries(running, retry, blocked),
+      status: issue_status(running, retry, blocked),
+      workspace: workspace_payload(issue_identifier, running, retry, blocked),
+      attempts: attempts_payload(retry),
+      running: maybe_running_issue_payload(running),
+      retry: maybe_retry_issue_payload(retry),
+      blocked: maybe_blocked_issue_payload(blocked),
       logs: %{
         codex_session_logs: []
       },
-      recent_events: (running && recent_events_payload(running)) || [],
-      last_error: retry && retry.error,
+      recent_events: issue_recent_events(running, blocked),
+      last_error: issue_last_error(retry, blocked),
       tracked: %{}
     }
   end
 
-  defp issue_id_from_entries(running, retry),
-    do: (running && running.issue_id) || (retry && retry.issue_id)
+  defp issue_id_from_entries(running, retry, blocked),
+    do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(_running, nil), do: "running"
-  defp issue_status(nil, _retry), do: "retrying"
-  defp issue_status(_running, _retry), do: "running"
+  defp workspace_payload(issue_identifier, running, retry, blocked) do
+    %{
+      path: workspace_path(issue_identifier, running, retry, blocked),
+      host: workspace_host(running, retry, blocked)
+    }
+  end
+
+  defp attempts_payload(retry) do
+    %{
+      restart_count: restart_count(retry),
+      current_retry_attempt: retry_attempt(retry)
+    }
+  end
+
+  defp maybe_running_issue_payload(nil), do: nil
+  defp maybe_running_issue_payload(running), do: running_issue_payload(running)
+
+  defp maybe_retry_issue_payload(nil), do: nil
+  defp maybe_retry_issue_payload(retry), do: retry_issue_payload(retry)
+
+  defp maybe_blocked_issue_payload(nil), do: nil
+  defp maybe_blocked_issue_payload(blocked), do: blocked_issue_payload(blocked)
+
+  defp issue_recent_events(running, blocked) do
+    cond do
+      not is_nil(running) -> recent_events_payload(running)
+      not is_nil(blocked) -> recent_events_payload(blocked)
+      true -> []
+    end
+  end
+
+  defp issue_last_error(nil, nil), do: nil
+  defp issue_last_error(retry, nil), do: retry.error
+  defp issue_last_error(_retry, blocked), do: blocked.error
+
+  defp issue_status(_running, _retry, blocked) when not is_nil(blocked), do: "blocked"
+  defp issue_status(_running, nil, _blocked), do: "running"
+  defp issue_status(nil, _retry, _blocked), do: "retrying"
+  defp issue_status(_running, _retry, _blocked), do: "running"
 
   defp running_entry_payload(entry) do
     recent_events = recent_events_payload(entry)
@@ -136,6 +170,37 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp blocked_entry_payload(entry) do
+    recent_events = recent_events_payload(entry)
+    last_message = summarize_message(entry.last_codex_message)
+    last_event_at = iso8601(entry.last_codex_timestamp)
+
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      state: entry.state,
+      blocked_on: entry.blocked_on,
+      error: entry.error,
+      failed_at: iso8601(Map.get(entry, :failed_at)),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      session_id: entry.session_id,
+      turn_count: Map.get(entry, :turn_count, 0),
+      last_event: entry.last_codex_event,
+      last_message: last_message,
+      started_at: iso8601(entry.started_at),
+      last_event_at: last_event_at,
+      last_activity_at: last_event_at,
+      current_activity: last_message,
+      recent_events: recent_events,
+      tokens: %{
+        input_tokens: entry.codex_input_tokens,
+        output_tokens: entry.codex_output_tokens,
+        total_tokens: entry.codex_total_tokens
+      }
+    }
+  end
+
   defp running_issue_payload(running) do
     recent_events = recent_events_payload(running)
     last_message = summarize_message(running.last_codex_message)
@@ -173,14 +238,18 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry) do
+  defp blocked_issue_payload(blocked), do: blocked_entry_payload(blocked)
+
+  defp workspace_path(issue_identifier, running, retry, blocked) do
     (running && Map.get(running, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
+      (blocked && Map.get(blocked, :workspace_path)) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry) do
-    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
+  defp workspace_host(running, retry, blocked) do
+    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host)) ||
+      (blocked && Map.get(blocked, :worker_host))
   end
 
   defp recent_events_payload(running) do

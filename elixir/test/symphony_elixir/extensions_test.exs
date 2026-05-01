@@ -353,7 +353,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 0},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -385,6 +385,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => nil
                }
              ],
+             "blocked" => [],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -423,6 +424,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
+             "blocked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
@@ -526,6 +528,78 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_payload["running"]["workspace_path"] == "/tmp/symphony-workspaces/HIN-29"
     assert issue_payload["running"]["blocked_on"] == "approval"
     assert issue_payload["recent_events"] == running["recent_events"]
+  end
+
+  test "phoenix observability api exposes blocked failure entries" do
+    orchestrator_name = Module.concat(__MODULE__, :BlockedFailureOrchestrator)
+    started_at = DateTime.utc_now()
+    event_at = ~U[2026-05-01 10:13:12Z]
+
+    snapshot =
+      static_snapshot()
+      |> put_in([:running], [])
+      |> put_in([:retrying], [])
+      |> put_in([:blocked], [
+        %{
+          issue_id: "issue-hin-24",
+          identifier: "HIN-24",
+          state: "In Progress",
+          blocked_on: "mcp_elicitation",
+          error: "{:turn_input_required, %{\"method\" => \"mcpServer/elicitation/request\", \"params\" => %{\"_meta\" => %{\"tool_title\" => \"create_pull_request\"}}}}",
+          failed_at: event_at,
+          worker_host: nil,
+          workspace_path: "/tmp/symphony-workspaces/HIN-24",
+          session_id: "thread-hin24-turn-1",
+          turn_count: 1,
+          last_codex_event: :turn_ended_with_error,
+          last_codex_message: %{
+            event: :turn_ended_with_error,
+            message: %{reason: {:turn_input_required, %{"method" => "mcpServer/elicitation/request"}}}
+          },
+          last_codex_timestamp: event_at,
+          recent_events: [
+            %{
+              timestamp: event_at,
+              event: :turn_ended_with_error,
+              message: %{
+                event: :turn_ended_with_error,
+                message: %{reason: {:turn_input_required, %{"method" => "mcpServer/elicitation/request"}}}
+              }
+            }
+          ],
+          codex_input_tokens: 100,
+          codex_output_tokens: 25,
+          codex_total_tokens: 125,
+          started_at: started_at
+        }
+      ])
+
+    {:ok, _orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = get(build_conn(), "/api/v1/state") |> json_response(200)
+    [blocked] = state_payload["blocked"]
+
+    assert state_payload["counts"] == %{"running" => 0, "retrying" => 0, "blocked" => 1}
+    assert blocked["issue_identifier"] == "HIN-24"
+    assert blocked["blocked_on"] == "mcp_elicitation"
+    assert blocked["error"] =~ "create_pull_request"
+    assert blocked["workspace_path"] == "/tmp/symphony-workspaces/HIN-24"
+    assert blocked["session_id"] == "thread-hin24-turn-1"
+    assert blocked["tokens"] == %{"input_tokens" => 100, "output_tokens" => 25, "total_tokens" => 125}
+
+    issue_payload = get(build_conn(), "/api/v1/HIN-24") |> json_response(200)
+    assert issue_payload["status"] == "blocked"
+    assert issue_payload["blocked"]["blocked_on"] == "mcp_elicitation"
+    assert issue_payload["blocked"]["error"] =~ "mcpServer/elicitation/request"
+    assert issue_payload["last_error"] == blocked["error"]
+    assert issue_payload["recent_events"] == blocked["recent_events"]
   end
 
   test "phoenix observability api exposes MCP elicitation blockers" do
@@ -810,7 +884,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 0}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -880,6 +954,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           error: "boom"
         }
       ],
+      blocked: [],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
