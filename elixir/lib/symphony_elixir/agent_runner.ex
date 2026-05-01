@@ -8,6 +8,8 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.RuntimeProfile
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
+  @comment_command_min_turns 2
+
   @type worker_host :: String.t() | nil
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -87,7 +89,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_agent_failure(_recipient, _issue, _reason), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    max_turns = effective_max_turns(opts)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
     with {:ok, runtime_profile} <- RuntimeProfile.resolve(Issue.label_names(issue), Config.settings!().codex) do
@@ -119,13 +121,14 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             require_final_response_item: command_context?(opts)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      case command_minimum_turn_continuation(issue, issue_state_fetcher, opts, turn_number, max_turns) do
+        {:continue, refreshed_issue} ->
+          Logger.info("Continuing comment-command run for #{issue_context(refreshed_issue)} to satisfy minimum command turns turn=#{turn_number}/#{max_turns}")
 
           do_run_codex_turns(
             app_session,
@@ -138,13 +141,17 @@ defmodule SymphonyElixir.AgentRunner do
             max_turns
           )
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
-
-        {:done, _refreshed_issue} ->
-          :ok
+        :not_required ->
+          continue_after_normal_turn(
+            app_session,
+            workspace,
+            issue,
+            codex_update_recipient,
+            opts,
+            issue_state_fetcher,
+            turn_number,
+            max_turns
+          )
 
         {:error, reason} ->
           {:error, reason}
@@ -152,24 +159,77 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp continue_after_normal_turn(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    case continue_with_issue?(issue, issue_state_fetcher, opts) do
+      {:continue, refreshed_issue} when turn_number < max_turns ->
+        Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+        do_run_codex_turns(
+          app_session,
+          workspace,
+          refreshed_issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          turn_number + 1,
+          max_turns
+        )
+
+      {:continue, refreshed_issue} ->
+        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+        :ok
+
+      {:done, _refreshed_issue} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
+    completion_guidance = continuation_completion_guidance(opts)
+
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
+    - The previous Codex turn completed normally, but the Linear issue is still in a state that requires continuation.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    #{completion_guidance}
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continuation_completion_guidance(opts) do
+    case Keyword.get(opts, :comment_command_context) do
+      context when is_map(context) ->
+        command = Map.get(context, :command) || Map.get(context, "command") || "comment command"
+
+        "- For this `#{command}` comment-command run, do not treat command detection or dispatch itself as success. Complete the requested command with the appropriate durable artifact, such as a pushed PR update, Linear handoff/comment, project update, blocker, or explicit no-op reason."
+
+      _context ->
+        ""
+    end
+  end
+
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, opts) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
+        if active_issue_state?(refreshed_issue.state, Keyword.get(opts, :continuation_states, [])) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -183,16 +243,76 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_with_issue?(issue, _issue_state_fetcher, _opts), do: {:done, issue}
 
-  defp active_issue_state?(state_name) when is_binary(state_name) do
+  defp effective_max_turns(opts) do
+    configured_max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+
+    if command_context?(opts) do
+      max(configured_max_turns, @comment_command_min_turns)
+    else
+      configured_max_turns
+    end
+  end
+
+  defp command_minimum_turn_continuation(issue, issue_state_fetcher, opts, turn_number, max_turns) do
+    if command_minimum_turn_possible?(opts, turn_number, max_turns) do
+      case refresh_issue_for_command_continuation(issue, issue_state_fetcher) do
+        {:ok, %Issue{} = refreshed_issue} ->
+          if terminal_issue_state?(issue_state(refreshed_issue)) do
+            :not_required
+          else
+            {:continue, refreshed_issue}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      :not_required
+    end
+  end
+
+  defp command_minimum_turn_possible?(opts, turn_number, max_turns) do
+    command_context?(opts) and turn_number < @comment_command_min_turns and turn_number < max_turns
+  end
+
+  defp refresh_issue_for_command_continuation(%Issue{id: issue_id} = issue, issue_state_fetcher)
+       when is_binary(issue_id) do
+    case issue_state_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} -> {:ok, refreshed_issue}
+      {:ok, []} -> {:ok, issue}
+      {:error, reason} -> {:error, {:issue_state_refresh_failed, reason}}
+    end
+  end
+
+  defp refresh_issue_for_command_continuation(issue, _issue_state_fetcher), do: {:ok, issue}
+
+  defp command_context?(opts) do
+    match?(context when is_map(context), Keyword.get(opts, :comment_command_context))
+  end
+
+  defp issue_state(%Issue{state: state}), do: state
+  defp issue_state(_issue), do: nil
+
+  defp active_issue_state?(state_name, additional_states) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
 
     Config.settings!().tracker.active_states
+    |> Enum.concat(List.wrap(additional_states))
     |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)
   end
 
-  defp active_issue_state?(_state_name), do: false
+  defp active_issue_state?(_state_name, _additional_states), do: false
+
+  defp terminal_issue_state?(state_name) when is_binary(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+
+    Config.settings!().tracker.terminal_states
+    |> Enum.any?(fn terminal_state -> normalize_issue_state(terminal_state) == normalized_state end)
+  end
+
+  defp terminal_issue_state?(_state_name), do: false
 
   defp selected_worker_host(nil, []), do: nil
 

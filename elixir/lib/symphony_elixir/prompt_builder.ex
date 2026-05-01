@@ -91,8 +91,22 @@ defmodule SymphonyElixir.PromptBuilder do
       ```
 
       Handle this explicit command according to the workflow contract. Ordinary Linear comments remain discussion only.
+
+      Command detection and dispatch are not completion. Before ending this turn, produce the appropriate durable artifact for `#{command}`: a pushed PR update, Linear handoff/comment, Project Update, blocker, acknowledgement, or explicit no-op reason.
+
+      If repository docs mention older supervised-only or one-turn comment-command limitations, treat those notes as stale for this run. The active Symphony runner supports unattended command completion and this explicit command block is the controlling instruction.
+      #{command_specific_guidance(command)}
       """
   end
 
   defp append_comment_command_context(prompt, _context), do: prompt
+
+  defp command_specific_guidance("/rework-pr") do
+    """
+
+    This is a review-rework command, not a request to perform a read-only code review or return only a plan. Apply the requested scoped revision to the existing draft PR branch, run the relevant verification, push the branch, and leave a fresh Linear handoff. If no change is appropriate, post a fresh Linear comment explaining the no-op reason before ending the turn.
+    """
+  end
+
+  defp command_specific_guidance(_command), do: ""
 end
