@@ -178,6 +178,8 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:default_profile, :map, default: %{"model" => "gpt-5.5", "reasoning" => "medium"})
+      field(:complexity_profiles, :map, default: %{})
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -203,6 +205,8 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :default_profile,
+          :complexity_profiles,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,

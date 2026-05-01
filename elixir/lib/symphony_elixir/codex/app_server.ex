@@ -4,7 +4,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.{DynamicTool, RuntimeProfile}
+  alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -39,10 +40,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    codex_profile = Keyword.get(opts, :codex_profile, RuntimeProfile.default(Config.settings!().codex))
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
-      metadata = port_metadata(port, worker_host)
+         {:ok, port} <- start_port(expanded_workspace, worker_host, codex_profile) do
+      metadata = port_metadata(port, worker_host, codex_profile)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
@@ -186,43 +188,57 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil) do
+  defp start_port(workspace, nil, codex_profile) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
-        )
+      with {:ok, command} <- launch_command(codex_profile) do
+        port =
+          Port.open(
+            {:spawn_executable, String.to_charlist(executable)},
+            [
+              :binary,
+              :exit_status,
+              :stderr_to_stdout,
+              args: [~c"-lc", String.to_charlist(command)],
+              cd: String.to_charlist(workspace),
+              line: @port_line_bytes
+            ]
+          )
 
-      {:ok, port}
+        {:ok, port}
+      end
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+  defp start_port(workspace, worker_host, codex_profile) when is_binary(worker_host) do
+    with {:ok, remote_command} <- remote_launch_command(workspace, codex_profile) do
+      SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    end
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
-    [
-      "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
-    ]
-    |> Enum.join(" && ")
+  defp launch_command(codex_profile) do
+    RuntimeProfile.render_command(Config.settings!().codex.command, codex_profile)
+  end
+
+  defp remote_launch_command(workspace, codex_profile) when is_binary(workspace) do
+    with {:ok, command} <- launch_command(codex_profile) do
+      {:ok,
+       [
+         "cd #{shell_escape(workspace)}",
+         "exec #{command}"
+       ]
+       |> Enum.join(" && ")}
+    end
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
+    port_metadata(port, worker_host, RuntimeProfile.default(Config.settings!().codex))
+  end
+
+  defp port_metadata(port, worker_host, codex_profile) when is_port(port) do
     base_metadata =
       case :erlang.port_info(port, :os_pid) do
         {:os_pid, os_pid} ->
@@ -231,6 +247,15 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ ->
           %{}
       end
+
+    base_metadata =
+      Map.merge(base_metadata, %{
+        codex_model: Map.fetch!(codex_profile, :model),
+        codex_reasoning: Map.fetch!(codex_profile, :reasoning),
+        codex_complexity: Map.get(codex_profile, :complexity),
+        codex_profile_source: Map.fetch!(codex_profile, :source),
+        codex_profile_fallback: Map.fetch!(codex_profile, :fallback?)
+      })
 
     case worker_host do
       host when is_binary(host) -> Map.put(base_metadata, :worker_host, host)
