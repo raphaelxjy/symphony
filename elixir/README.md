@@ -99,7 +99,14 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex app-server
+  command: codex --config 'model="{{ codex.model }}"' --config model_reasoning_effort={{ codex.reasoning }} app-server
+  default_profile:
+    model: gpt-5.5
+    reasoning: medium
+  complexity_profiles:
+    high:
+      model: gpt-5.5
+      reasoning: high
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -119,6 +126,12 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
+- `codex.command` is rendered immediately before app-server startup with `{{ codex.model }}` and
+  `{{ codex.reasoning }}` from the selected runtime profile. If an issue has one recognized
+  complexity label, Symphony selects the matching `codex.complexity_profiles` entry. Labels are
+  matched case-insensitively and may be flat (`High`) or grouped (`Complexity/High`). Issues with no
+  complexity label use `codex.default_profile`; issues with multiple complexity labels fail before
+  Codex is launched.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - `comment_commands.enabled` turns on polling for explicit Linear issue comment commands. Symphony
@@ -147,7 +160,13 @@ hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
-  command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+  command: "$CODEX_BIN --config 'model=\"{{ codex.model }}\"' --config model_reasoning_effort={{ codex.reasoning }} app-server"
+  default_profile: {model: gpt-5.5, reasoning: medium}
+  complexity_profiles:
+    low: {model: gpt-5.5, reasoning: low}
+    medium: {model: gpt-5.5, reasoning: medium}
+    high: {model: gpt-5.5, reasoning: high}
+    extra_high: {model: gpt-5.5, reasoning: xhigh}
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.

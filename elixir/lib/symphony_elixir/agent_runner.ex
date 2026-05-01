@@ -5,6 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.RuntimeProfile
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
@@ -80,11 +81,23 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
+    with {:ok, runtime_profile} <- RuntimeProfile.resolve(Issue.label_names(issue), Config.settings!().codex) do
+      Logger.info(
+        "Resolved Codex runtime for #{issue_context(issue)} complexity=#{Map.get(runtime_profile, :complexity) || "default"} model=#{Map.fetch!(runtime_profile, :model)} reasoning=#{Map.fetch!(runtime_profile, :reasoning)} fallback=#{Map.fetch!(runtime_profile, :fallback?)}"
+      )
+
+      start_opts =
+        opts
+        |> Keyword.take([:worker_host])
+        |> Keyword.put(:worker_host, worker_host)
+        |> Keyword.put(:codex_profile, runtime_profile)
+
+      with {:ok, session} <- AppServer.start_session(workspace, start_opts) do
+        try do
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        after
+          AppServer.stop_session(session)
+        end
       end
     end
   end
