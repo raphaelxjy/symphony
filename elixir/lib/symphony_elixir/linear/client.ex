@@ -551,7 +551,10 @@ defmodule SymphonyElixir.Linear.Client do
          },
          assignee_filter
        ) do
-    {:ok, issue_comment_entries(nodes, assignee_filter), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+    entries = issue_comment_entries(nodes, assignee_filter)
+    page_info = %{has_next_page: has_next_page == true, end_cursor: end_cursor}
+
+    {:ok, entries, page_info}
   end
 
   defp decode_linear_comment_page_response(%{"errors" => errors}, _assignee_filter) do

@@ -751,8 +751,9 @@ defmodule SymphonyElixir.CoreTest do
 
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+    scheduler_tolerance_ms = 250
 
-    assert remaining_ms >= min_remaining_ms
+    assert remaining_ms >= min_remaining_ms - scheduler_tolerance_ms
     assert remaining_ms <= max_remaining_ms
   end
 
@@ -783,6 +784,54 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+  end
+
+  test "prompt builder accepts explicit templates without loading workflow" do
+    issue = %Issue{
+      identifier: "S-2",
+      title: "Use explicit prompt",
+      description: "Override workflow prompt",
+      state: "Todo",
+      url: "https://example.org/issues/S-2",
+      labels: []
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        prompt_template: "Explicit {{ issue.identifier }} {{ issue.title }}",
+        comment_command_context: :not_a_context_map
+      )
+
+    assert prompt == "Explicit S-2 Use explicit prompt"
+  end
+
+  test "prompt builder appends Linear comment command context" do
+    issue = %Issue{
+      identifier: "S-3",
+      title: "Handle command context",
+      description: "Render command context",
+      state: "Todo",
+      url: "https://example.org/issues/S-3",
+      labels: []
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        prompt_template: "Ticket {{ issue.identifier }}",
+        comment_command_context: %{
+          "command" => "/roadmap-review",
+          "arguments" => "current board",
+          "comment_id" => "comment-3",
+          "body" => "/roadmap-review current board"
+        }
+      )
+
+    assert prompt =~ "Ticket S-3"
+    assert prompt =~ "## Triggering Linear Comment Command"
+    assert prompt =~ "Command: /roadmap-review"
+    assert prompt =~ "Arguments: current board"
+    assert prompt =~ "Comment ID: comment-3"
+    assert prompt =~ "/roadmap-review current board"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do

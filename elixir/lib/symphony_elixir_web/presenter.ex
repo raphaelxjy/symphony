@@ -222,8 +222,6 @@ defmodule SymphonyElixirWeb.Presenter do
     |> Enum.find_value(& &1.blocked_on)
   end
 
-  defp latest_blocker(_events), do: nil
-
   defp classify_blocker(event, message) do
     event_text = event |> to_string() |> String.downcase()
     message_text = message |> inspect(limit: 50, printable_limit: 500) |> String.downcase()
@@ -231,6 +229,9 @@ defmodule SymphonyElixirWeb.Presenter do
     cond do
       String.contains?(event_text, ["auto_approved", "auto_answered"]) ->
         nil
+
+      String.contains?(message_text, ["mcpserver/elicitation/request"]) ->
+        "mcp_elicitation"
 
       String.contains?(event_text, ["approval_required"]) or
           String.contains?(message_text, ["approval_required", "requestapproval"]) ->

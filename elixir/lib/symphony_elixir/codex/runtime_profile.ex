@@ -46,7 +46,7 @@ defmodule SymphonyElixir.Codex.RuntimeProfile do
   def render_command(command_template, profile) when is_binary(command_template) and is_map(profile) do
     command_template
     |> Solid.parse!()
-    |> Solid.render(
+    |> Solid.render!(
       %{
         "codex" => %{
           "model" => Map.fetch!(profile, :model),
@@ -59,10 +59,8 @@ defmodule SymphonyElixir.Codex.RuntimeProfile do
       strict_variables: true,
       strict_filters: true
     )
-    |> case do
-      {:ok, rendered, _warnings} -> {:ok, IO.iodata_to_binary(rendered)}
-      {:error, reason} -> {:error, {:codex_command_template_error, reason}}
-    end
+    |> IO.iodata_to_binary()
+    |> then(&{:ok, &1})
   rescue
     error ->
       {:error, {:codex_command_template_error, Exception.message(error)}}

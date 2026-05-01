@@ -1383,6 +1383,20 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_method("account/chatgptAuthTokens/refresh", _payload), do: "account auth token refresh requested"
 
+  defp humanize_codex_method("mcpServer/elicitation/request", payload) do
+    details =
+      []
+      |> append_detail("server", mcp_elicitation_detail(payload, "server"))
+      |> append_detail("tool", mcp_elicitation_detail(payload, "tool"))
+      |> append_detail("request", mcp_elicitation_detail(payload, "request"))
+
+    if details == [] do
+      "mcp elicitation requested"
+    else
+      "mcp elicitation requested (#{Enum.join(details, ", ")})"
+    end
+  end
+
   defp humanize_codex_method("item/tool/call", payload) do
     tool = dynamic_tool_name(payload)
 
@@ -1408,6 +1422,56 @@ defmodule SymphonyElixir.StatusDashboard do
       method
     end
   end
+
+  defp mcp_elicitation_detail(payload, field), do: extract_first_path(payload, mcp_elicitation_paths(field))
+
+  defp mcp_elicitation_paths("server"),
+    do: [
+      ["params", "server"],
+      [:params, :server],
+      ["params", "msg", "server"],
+      [:params, :msg, :server]
+    ]
+
+  defp mcp_elicitation_paths("tool"),
+    do: [
+      ["params", "tool"],
+      [:params, :tool],
+      ["params", "name"],
+      [:params, :name],
+      ["params", "msg", "tool"],
+      [:params, :msg, :tool],
+      ["params", "msg", "name"],
+      [:params, :msg, :name]
+    ]
+
+  defp mcp_elicitation_paths("request"),
+    do: [
+      ["params", "request"],
+      [:params, :request],
+      ["params", "question"],
+      [:params, :question],
+      ["params", "prompt"],
+      [:params, :prompt],
+      ["params", "msg", "request"],
+      [:params, :msg, :request],
+      ["params", "msg", "question"],
+      [:params, :msg, :question],
+      ["params", "msg", "prompt"],
+      [:params, :msg, :prompt]
+    ]
+
+  defp append_detail(details, label, value) when is_binary(value) do
+    value = inline_text(value)
+
+    if value == "" do
+      details
+    else
+      details ++ ["#{label}: #{value}"]
+    end
+  end
+
+  defp append_detail(details, _label, _value), do: details
 
   defp humanize_dynamic_tool_event(base, payload) do
     case dynamic_tool_name(payload) do
