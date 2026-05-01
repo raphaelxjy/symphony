@@ -1470,7 +1470,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {"item/commandExecution/requestApproval", %{"params" => %{"parsedCmd" => "git status"}}, "command approval requested (git status)"},
       {"item/fileChange/requestApproval", %{"params" => %{"fileChangeCount" => 2}}, "file change approval requested (2 files)"},
       {"item/tool/call", %{"params" => %{"tool" => "linear_graphql"}}, "dynamic tool call requested (linear_graphql)"},
-      {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input: Continue?"}
+      {"item/tool/requestUserInput", %{"params" => %{"question" => "Continue?"}}, "tool requires user input: Continue?"},
+      {"mcpServer/elicitation/request",
+       %{
+         "params" => %{
+           "server" => "codex_apps",
+           "tool" => "linear",
+           "request" => "Choose an issue source"
+         }
+       }, "mcp elicitation requested (server: codex_apps, tool: linear, request: Choose an issue source)"}
     ]
 
     Enum.each(event_cases, fn {method, payload, expected_fragment} ->

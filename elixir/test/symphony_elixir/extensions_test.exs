@@ -528,6 +528,73 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_payload["recent_events"] == running["recent_events"]
   end
 
+  test "phoenix observability api exposes MCP elicitation blockers" do
+    orchestrator_name = Module.concat(__MODULE__, :McpElicitationOrchestrator)
+    event_at = ~U[2026-05-01 00:00:04Z]
+
+    mcp_elicitation_message = %{
+      event: :notification,
+      message: %{
+        "method" => "mcpServer/elicitation/request",
+        "params" => %{
+          "server" => "codex_apps",
+          "tool" => "linear",
+          "request" => "Choose an issue source"
+        }
+      }
+    }
+
+    snapshot =
+      static_snapshot()
+      |> put_in([:running], [
+        %{
+          issue_id: "issue-mcp-elicitation",
+          identifier: "HIN-31",
+          state: "In Progress",
+          worker_host: nil,
+          workspace_path: "/tmp/symphony-workspaces/HIN-31",
+          session_id: "thread-mcp-turn-1",
+          turn_count: 1,
+          codex_app_server_pid: "5151",
+          last_codex_event: :notification,
+          last_codex_message: mcp_elicitation_message,
+          last_codex_timestamp: event_at,
+          recent_events: [
+            %{
+              timestamp: event_at,
+              event: :notification,
+              message: mcp_elicitation_message
+            }
+          ],
+          codex_input_tokens: 20,
+          codex_output_tokens: 7,
+          codex_total_tokens: 27,
+          started_at: DateTime.utc_now()
+        }
+      ])
+
+    {:ok, _orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = get(build_conn(), "/api/v1/state") |> json_response(200)
+    [running] = state_payload["running"]
+
+    assert running["issue_identifier"] == "HIN-31"
+    assert running["current_activity"] =~ "mcp elicitation requested"
+    assert running["blocked_on"] == "mcp_elicitation"
+    assert [%{"blocked_on" => "mcp_elicitation"}] = running["recent_events"]
+
+    issue_payload = get(build_conn(), "/api/v1/HIN-31") |> json_response(200)
+    assert issue_payload["running"]["blocked_on"] == "mcp_elicitation"
+    assert issue_payload["recent_events"] == running["recent_events"]
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)

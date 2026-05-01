@@ -192,10 +192,10 @@ matter to enable the dashboard. The JSON API exposes:
   activity, blocker, and recent Codex event history
 - `/api/v1/refresh` to request an immediate poll/reconcile pass
 
-The dashboard surfaces approval and user-input blockers for live sessions, but
-manual approval from the dashboard is not supported yet. Keep approvals in the
-operator's Codex surface until an explicit upstream approval-submission path is
-implemented.
+The dashboard surfaces approval, user-input, and MCP elicitation blockers for
+live sessions, but manual approval or input from the dashboard is not supported
+yet. Keep approvals and input in the operator's Codex surface until an explicit
+upstream submission path is implemented.
 
 ## Project Layout
 

@@ -40,7 +40,7 @@ defmodule SymphonyElixir.Linear.CommentCommand do
     MapSet.to_list(@commands) |> Enum.sort()
   end
 
-  @spec parse(Issue.t(), map()) :: {:ok, t()} | :ignore | {:error, term()}
+  @spec parse(Issue.t(), map()) :: {:ok, t()} | :ignore
   def parse(%Issue{} = issue, comment) when is_map(comment) do
     comment_id = Map.get(comment, :id) || Map.get(comment, "id")
     body = Map.get(comment, :body) || Map.get(comment, "body")
@@ -69,7 +69,6 @@ defmodule SymphonyElixir.Linear.CommentCommand do
        }}
     else
       :ignore -> :ignore
-      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -102,7 +101,6 @@ defmodule SymphonyElixir.Linear.CommentCommand do
       MapSet.member?(@planner_commands, command) -> {:ok, :planner}
       command == @approve_command -> {:ok, :approve_plan}
       command == @rework_command -> {:ok, :rework_pr}
-      true -> :ignore
     end
   end
 

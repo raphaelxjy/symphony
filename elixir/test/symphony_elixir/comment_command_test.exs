@@ -7,6 +7,16 @@ defmodule SymphonyElixir.CommentCommandTest do
   test "parses only explicit command prefixes on the first non-blank line" do
     issue = %Issue{id: "issue-1", identifier: "HIN-1", state: "Backlog"}
 
+    assert CommentCommand.command_prefixes() == [
+             "/approve-plan",
+             "/block",
+             "/revise-plan",
+             "/rework-pr",
+             "/roadmap-review",
+             "/split-task",
+             "/unblock"
+           ]
+
     assert {:ok, command} =
              CommentCommand.parse(issue, %{
                id: "comment-1",
@@ -29,6 +39,8 @@ defmodule SymphonyElixir.CommentCommandTest do
     assert :ignore = CommentCommand.parse(issue, %{id: "comment-2", body: "please /roadmap-review"})
     assert :ignore = CommentCommand.parse(issue, %{id: "comment-3", body: "/unknown"})
     assert :ignore = CommentCommand.parse(issue, %{id: "comment-4", body: ""})
+    assert :ignore = CommentCommand.parse(issue, %{id: "comment-5"})
+    assert :ignore = CommentCommand.parse(issue, "not a comment")
   end
 
   test "dispatches planner commands once and ignores ordinary comments" do
