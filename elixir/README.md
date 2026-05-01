@@ -160,6 +160,19 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 
+Start Symphony with `--port <port>` or set `server.port` in the workflow front
+matter to enable the dashboard. The JSON API exposes:
+
+- `/api/v1/state` for all active and retrying issues
+- `/api/v1/<issue_identifier>` for one issue's workspace, session, token,
+  activity, blocker, and recent Codex event history
+- `/api/v1/refresh` to request an immediate poll/reconcile pass
+
+The dashboard surfaces approval and user-input blockers for live sessions, but
+manual approval from the dashboard is not supported yet. Keep approvals in the
+operator's Codex surface until an explicit upstream approval-submission path is
+implemented.
+
 ## Project Layout
 
 - `lib/`: application code and Mix tasks

@@ -131,20 +131,26 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div class="table-wrap">
               <table class="data-table data-table-running">
                 <colgroup>
-                  <col style="width: 12rem;" />
+                  <col style="width: 9rem;" />
+                  <col style="width: 7rem;" />
                   <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
+                  <col style="width: 7rem;" />
+                  <col style="width: 8rem;" />
                   <col />
+                  <col style="width: 12rem;" />
+                  <col style="width: 16rem;" />
                   <col style="width: 10rem;" />
                 </colgroup>
                 <thead>
                   <tr>
                     <th>Issue</th>
                     <th>State</th>
+                    <th>Blocker</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
-                    <th>Codex update</th>
+                    <th>Activity</th>
+                    <th>Last activity</th>
+                    <th>Workspace</th>
                     <th>Tokens</th>
                   </tr>
                 </thead>
@@ -159,6 +165,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <span class={state_badge_class(entry.state)}>
                         <%= entry.state %>
+                      </span>
+                    </td>
+                    <td>
+                      <span class={blocker_badge_class(entry.blocked_on)}>
+                        <%= entry.blocked_on || "none" %>
                       </span>
                     </td>
                     <td>
@@ -183,15 +194,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="detail-stack">
                         <span
                           class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                          title={entry.current_activity || to_string(entry.last_event || "n/a")}
+                        ><%= entry.current_activity || to_string(entry.last_event || "n/a") %></span>
                         <span class="muted event-meta">
                           <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
                         </span>
                       </div>
+                    </td>
+                    <td class="mono numeric"><%= entry.last_activity_at || "n/a" %></td>
+                    <td>
+                      <span class="workspace-text" title={entry.workspace_path || "n/a"}>
+                        <%= entry.workspace_path || "n/a" %>
+                      </span>
                     </td>
                     <td>
                       <div class="token-stack numeric">
@@ -320,6 +334,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp blocker_badge_class(nil), do: "state-badge state-badge-muted"
+  defp blocker_badge_class("approval"), do: "state-badge state-badge-danger"
+  defp blocker_badge_class("user_input"), do: "state-badge state-badge-warning"
+  defp blocker_badge_class(_blocked_on), do: "state-badge state-badge-warning"
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

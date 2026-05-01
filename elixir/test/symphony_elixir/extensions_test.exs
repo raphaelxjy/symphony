@@ -356,6 +356,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
+                 "last_activity_at" => nil,
+                 "current_activity" => "rendered",
+                 "blocked_on" => nil,
+                 "recent_events" => [],
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -401,6 +405,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
+               "last_activity_at" => nil,
+               "current_activity" => "rendered",
+               "blocked_on" => nil,
+               "recent_events" => [],
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
@@ -425,6 +433,88 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api exposes recent event history and blockers" do
+    orchestrator_name = Module.concat(__MODULE__, :EventHistoryOrchestrator)
+    started_at = DateTime.utc_now()
+    first_event_at = ~U[2026-05-01 00:00:00Z]
+    latest_event_at = ~U[2026-05-01 00:00:03Z]
+
+    snapshot =
+      static_snapshot()
+      |> put_in([:running], [
+        %{
+          issue_id: "issue-history",
+          identifier: "HIN-29",
+          state: "In Progress",
+          worker_host: nil,
+          workspace_path: "/tmp/symphony-workspaces/HIN-29",
+          session_id: "thread-history-turn-1",
+          turn_count: 3,
+          codex_app_server_pid: "5150",
+          last_codex_event: :turn_ended_with_error,
+          last_codex_message: %{event: :turn_ended_with_error, message: %{reason: {:approval_required, %{}}}},
+          last_codex_timestamp: latest_event_at,
+          recent_events: [
+            %{
+              timestamp: first_event_at,
+              event: :notification,
+              message: "running command"
+            },
+            %{
+              timestamp: latest_event_at,
+              event: :turn_ended_with_error,
+              message: %{event: :turn_ended_with_error, message: %{reason: {:approval_required, %{}}}}
+            }
+          ],
+          codex_input_tokens: 12,
+          codex_output_tokens: 5,
+          codex_total_tokens: 17,
+          started_at: started_at
+        }
+      ])
+
+    {:ok, _orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = get(build_conn(), "/api/v1/state") |> json_response(200)
+    [running] = state_payload["running"]
+
+    assert running["issue_identifier"] == "HIN-29"
+    assert running["workspace_path"] == "/tmp/symphony-workspaces/HIN-29"
+    assert running["session_id"] == "thread-history-turn-1"
+    assert running["turn_count"] == 3
+    assert running["tokens"] == %{"input_tokens" => 12, "output_tokens" => 5, "total_tokens" => 17}
+    assert running["last_activity_at"] == "2026-05-01T00:00:03Z"
+    assert running["current_activity"] =~ "turn ended with error"
+    assert running["blocked_on"] == "approval"
+
+    assert [
+             %{
+               "at" => "2026-05-01T00:00:00Z",
+               "event" => "notification",
+               "message" => "running command",
+               "blocked_on" => nil
+             },
+             %{
+               "at" => "2026-05-01T00:00:03Z",
+               "event" => "turn_ended_with_error",
+               "blocked_on" => "approval"
+             }
+           ] = running["recent_events"]
+
+    issue_payload = get(build_conn(), "/api/v1/HIN-29") |> json_response(200)
+
+    assert issue_payload["running"]["workspace_path"] == "/tmp/symphony-workspaces/HIN-29"
+    assert issue_payload["running"]["blocked_on"] == "approval"
+    assert issue_payload["recent_events"] == running["recent_events"]
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -547,7 +637,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Activity"
+    assert html =~ "Workspace"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
