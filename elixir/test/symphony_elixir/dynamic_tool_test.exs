@@ -3,21 +3,39 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
-  test "tool_specs advertises the linear_graphql input contract" do
-    assert [
-             %{
-               "description" => description,
-               "inputSchema" => %{
-                 "properties" => %{
-                   "query" => _,
-                   "variables" => _
-                 },
-                 "required" => ["query"],
-                 "type" => "object"
+  test "tool_specs advertises Linear handoff tools and the raw GraphQL escape hatch" do
+    specs = DynamicTool.tool_specs()
+
+    assert %{
+             "inputSchema" => %{
+               "properties" => %{"body" => _, "issueId" => _},
+               "required" => ["body"],
+               "type" => "object"
+             },
+             "name" => "linear_create_comment"
+           } = Enum.find(specs, &(&1["name"] == "linear_create_comment"))
+
+    assert %{
+             "inputSchema" => %{
+               "properties" => %{"issueId" => _, "stateName" => _},
+               "required" => ["stateName"],
+               "type" => "object"
+             },
+             "name" => "linear_update_issue_state"
+           } = Enum.find(specs, &(&1["name"] == "linear_update_issue_state"))
+
+    assert %{
+             "description" => description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "query" => _,
+                 "variables" => _
                },
-               "name" => "linear_graphql"
-             }
-           ] = DynamicTool.tool_specs()
+               "required" => ["query"],
+               "type" => "object"
+             },
+             "name" => "linear_graphql"
+           } = Enum.find(specs, &(&1["name"] == "linear_graphql"))
 
     assert description =~ "Linear"
   end
@@ -30,7 +48,11 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => [
+                 "linear_create_comment",
+                 "linear_update_issue_state",
+                 "linear_graphql"
+               ]
              }
            }
 
@@ -40,6 +62,147 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => response["output"]
              }
            ]
+  end
+
+  test "linear_create_comment posts to the current issue by default" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"body" => "## Handoff\n\nDone."},
+        current_issue: %Issue{id: "issue-123"},
+        comment_creator: fn issue_id, body ->
+          send(test_pid, {:comment_created, issue_id, body})
+          :ok
+        end
+      )
+
+    assert_received {:comment_created, "issue-123", "## Handoff\n\nDone."}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "ok" => true,
+             "issueId" => "issue-123",
+             "action" => "linear_create_comment"
+           }
+  end
+
+  test "linear_create_comment accepts an explicit issue id" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"issueId" => "HIN-23", "body" => "Ready for review"},
+        comment_creator: fn issue_id, body ->
+          send(test_pid, {:comment_created, issue_id, body})
+          :ok
+        end
+      )
+
+    assert_received {:comment_created, "HIN-23", "Ready for review"}
+    assert response["success"] == true
+  end
+
+  test "linear_update_issue_state moves the current issue by state name" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_update_issue_state",
+        %{"stateName" => "In Review"},
+        current_issue_id: "issue-456",
+        state_updater: fn issue_id, state_name ->
+          send(test_pid, {:state_updated, issue_id, state_name})
+          :ok
+        end
+      )
+
+    assert_received {:state_updated, "issue-456", "In Review"}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "ok" => true,
+             "issueId" => "issue-456",
+             "stateName" => "In Review",
+             "action" => "linear_update_issue_state"
+           }
+  end
+
+  test "Linear handoff tools validate issue defaults and required strings" do
+    missing_issue =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"body" => "Done"},
+        comment_creator: fn _issue_id, _body -> flunk("comment creator should not be called") end
+      )
+
+    assert missing_issue["success"] == false
+
+    assert Jason.decode!(missing_issue["output"]) == %{
+             "error" => %{
+               "message" => "Linear issue id is required when no current issue is available."
+             }
+           }
+
+    missing_body =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"body" => "   "},
+        current_issue_id: "issue-123",
+        comment_creator: fn _issue_id, _body -> flunk("comment creator should not be called") end
+      )
+
+    assert Jason.decode!(missing_body["output"]) == %{
+             "error" => %{
+               "message" => "`linear_create_comment` requires a non-empty `body` string."
+             }
+           }
+
+    missing_state =
+      DynamicTool.execute(
+        "linear_update_issue_state",
+        %{"stateName" => "   "},
+        current_issue_id: "issue-123",
+        state_updater: fn _issue_id, _state_name -> flunk("state updater should not be called") end
+      )
+
+    assert Jason.decode!(missing_state["output"]) == %{
+             "error" => %{
+               "message" => "`linear_update_issue_state` requires a non-empty `stateName` string."
+             }
+           }
+  end
+
+  test "Linear handoff tools format tracker failures" do
+    comment_response =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"issueId" => "issue-123", "body" => "Done"},
+        comment_creator: fn _issue_id, _body -> {:error, :comment_create_failed} end
+      )
+
+    assert comment_response["success"] == false
+
+    assert Jason.decode!(comment_response["output"]) == %{
+             "error" => %{
+               "message" => "Linear comment creation did not report success."
+             }
+           }
+
+    state_response =
+      DynamicTool.execute(
+        "linear_update_issue_state",
+        %{"issueId" => "issue-123", "stateName" => "Human Review"},
+        state_updater: fn _issue_id, _state_name -> {:error, :state_not_found} end
+      )
+
+    assert Jason.decode!(state_response["output"]) == %{
+             "error" => %{
+               "message" => "Linear workflow state was not found for the issue's team."
+             }
+           }
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do
