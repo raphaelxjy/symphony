@@ -3,11 +3,19 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.{Linear.Client, Linear.Issue, Tracker}
 
   @linear_graphql_tool "linear_graphql"
+  @linear_create_comment_tool "linear_create_comment"
+  @linear_update_issue_state_tool "linear_update_issue_state"
   @linear_graphql_description """
-  Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  Escape hatch: execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  """
+  @linear_create_comment_description """
+  Create a Linear issue comment. Defaults to the current issue when issueId is omitted.
+  """
+  @linear_update_issue_state_description """
+  Move a Linear issue to a named workflow state. Defaults to the current issue when issueId is omitted.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -25,10 +33,46 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
+  @linear_create_comment_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["body"],
+    "properties" => %{
+      "issueId" => %{
+        "type" => ["string", "null"],
+        "description" => "Linear issue id or identifier. Defaults to the current issue."
+      },
+      "body" => %{
+        "type" => "string",
+        "description" => "Markdown comment body."
+      }
+    }
+  }
+  @linear_update_issue_state_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["stateName"],
+    "properties" => %{
+      "issueId" => %{
+        "type" => ["string", "null"],
+        "description" => "Linear issue id or identifier. Defaults to the current issue."
+      },
+      "stateName" => %{
+        "type" => "string",
+        "description" => "Target Linear workflow state name."
+      }
+    }
+  }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
+      @linear_create_comment_tool ->
+        execute_linear_create_comment(arguments, opts)
+
+      @linear_update_issue_state_tool ->
+        execute_linear_update_issue_state(arguments, opts)
+
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
 
@@ -46,11 +90,54 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   def tool_specs do
     [
       %{
+        "name" => @linear_create_comment_tool,
+        "description" => @linear_create_comment_description,
+        "inputSchema" => @linear_create_comment_input_schema
+      },
+      %{
+        "name" => @linear_update_issue_state_tool,
+        "description" => @linear_update_issue_state_description,
+        "inputSchema" => @linear_update_issue_state_input_schema
+      },
+      %{
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
       }
     ]
+  end
+
+  defp execute_linear_create_comment(arguments, opts) do
+    comment_creator = Keyword.get(opts, :comment_creator, &Tracker.create_comment/2)
+
+    with {:ok, issue_id, body} <- normalize_comment_arguments(arguments, opts),
+         :ok <- comment_creator.(issue_id, body) do
+      success_response(%{
+        "ok" => true,
+        "issueId" => issue_id,
+        "action" => @linear_create_comment_tool
+      })
+    else
+      {:error, reason} ->
+        failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_linear_update_issue_state(arguments, opts) do
+    state_updater = Keyword.get(opts, :state_updater, &Tracker.update_issue_state/2)
+
+    with {:ok, issue_id, state_name} <- normalize_state_update_arguments(arguments, opts),
+         :ok <- state_updater.(issue_id, state_name) do
+      success_response(%{
+        "ok" => true,
+        "issueId" => issue_id,
+        "stateName" => state_name,
+        "action" => @linear_update_issue_state_tool
+      })
+    else
+      {:error, reason} ->
+        failure_response(tool_error_payload(reason))
+    end
   end
 
   defp execute_linear_graphql(arguments, opts) do
@@ -110,6 +197,83 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
+  defp normalize_comment_arguments(arguments, opts) when is_map(arguments) do
+    with {:ok, issue_id} <- normalize_issue_id(arguments, opts),
+         {:ok, body} <- normalize_body(arguments) do
+      {:ok, issue_id, body}
+    end
+  end
+
+  defp normalize_comment_arguments(_arguments, _opts), do: {:error, :invalid_arguments}
+
+  defp normalize_state_update_arguments(arguments, opts) when is_map(arguments) do
+    with {:ok, issue_id} <- normalize_issue_id(arguments, opts),
+         {:ok, state_name} <- normalize_state_name(arguments) do
+      {:ok, issue_id, state_name}
+    end
+  end
+
+  defp normalize_state_update_arguments(_arguments, _opts), do: {:error, :invalid_arguments}
+
+  defp normalize_issue_id(arguments, opts) do
+    issue_id =
+      arguments
+      |> map_value(["issueId", :issueId, "issue_id", :issue_id])
+      |> normalize_optional_string()
+
+    case issue_id || current_issue_id(opts) do
+      id when is_binary(id) and id != "" -> {:ok, id}
+      _ -> {:error, :missing_issue_id}
+    end
+  end
+
+  defp normalize_body(arguments) do
+    arguments
+    |> map_value(["body", :body])
+    |> normalize_required_string(:missing_body)
+  end
+
+  defp normalize_state_name(arguments) do
+    arguments
+    |> map_value(["stateName", :stateName, "state_name", :state_name])
+    |> normalize_required_string(:missing_state_name)
+  end
+
+  defp map_value(map, keys) do
+    Enum.find_value(keys, fn key -> Map.get(map, key) end)
+  end
+
+  defp normalize_optional_string(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> case do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_optional_string(_value), do: nil
+
+  defp normalize_required_string(value, error) when is_binary(value) do
+    value
+    |> String.trim()
+    |> case do
+      "" -> {:error, error}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp normalize_required_string(_value, error), do: {:error, error}
+
+  defp current_issue_id(opts) do
+    case Keyword.get(opts, :current_issue) do
+      %Issue{id: id} when is_binary(id) -> id
+      %{id: id} when is_binary(id) -> id
+      _ -> Keyword.get(opts, :current_issue_id)
+    end
+    |> normalize_optional_string()
+  end
+
   defp graphql_response(response) do
     success =
       case response do
@@ -123,6 +287,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp failure_response(payload) do
     dynamic_tool_response(false, encode_payload(payload))
+  end
+
+  defp success_response(payload) do
+    dynamic_tool_response(true, encode_payload(payload))
   end
 
   defp dynamic_tool_response(success, output) when is_boolean(success) and is_binary(output) do
@@ -164,6 +332,54 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_graphql.variables` must be a JSON object when provided."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_issue_id) do
+    %{
+      "error" => %{
+        "message" => "Linear issue id is required when no current issue is available."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_body) do
+    %{
+      "error" => %{
+        "message" => "`linear_create_comment` requires a non-empty `body` string."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_state_name) do
+    %{
+      "error" => %{
+        "message" => "`linear_update_issue_state` requires a non-empty `stateName` string."
+      }
+    }
+  end
+
+  defp tool_error_payload(:comment_create_failed) do
+    %{
+      "error" => %{
+        "message" => "Linear comment creation did not report success."
+      }
+    }
+  end
+
+  defp tool_error_payload(:issue_update_failed) do
+    %{
+      "error" => %{
+        "message" => "Linear issue state update did not report success."
+      }
+    }
+  end
+
+  defp tool_error_payload(:state_not_found) do
+    %{
+      "error" => %{
+        "message" => "Linear workflow state was not found for the issue's team."
       }
     }
   end
