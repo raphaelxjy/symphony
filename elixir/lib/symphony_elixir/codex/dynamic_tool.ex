@@ -108,15 +108,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp execute_linear_create_comment(arguments, opts) do
-    comment_creator = Keyword.get(opts, :comment_creator, &Tracker.create_comment/2)
+    comment_creator = Keyword.get(opts, :comment_creator, &Tracker.create_comment/3)
 
-    with {:ok, issue_id, body} <- normalize_comment_arguments(arguments, opts),
-         :ok <- comment_creator.(issue_id, body) do
-      success_response(%{
+    with {:ok, issue_id, body, comment_opts} <- normalize_comment_arguments(arguments, opts),
+         :ok <- call_comment_creator(comment_creator, issue_id, body, comment_opts) do
+      %{
         "ok" => true,
         "issueId" => issue_id,
         "action" => @linear_create_comment_tool
-      })
+      }
+      |> maybe_put_parent_id_response(Keyword.get(comment_opts, :parent_id))
+      |> success_response()
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
@@ -200,7 +202,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp normalize_comment_arguments(arguments, opts) when is_map(arguments) do
     with {:ok, issue_id} <- normalize_issue_id(arguments, opts),
          {:ok, body} <- normalize_body(arguments) do
-      {:ok, issue_id, body}
+      {:ok, issue_id, body, comment_parent_opts(opts)}
     end
   end
 
@@ -214,6 +216,51 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_state_update_arguments(_arguments, _opts), do: {:error, :invalid_arguments}
+
+  defp call_comment_creator(comment_creator, issue_id, body, comment_opts) when is_function(comment_creator) do
+    case {:erlang.fun_info(comment_creator, :arity), comment_opts} do
+      {{:arity, 3}, _opts} ->
+        comment_creator.(issue_id, body, comment_opts)
+
+      {{:arity, 2}, []} ->
+        comment_creator.(issue_id, body)
+
+      {{:arity, 2}, _opts} ->
+        {:error, :parent_comment_unsupported}
+
+      _ ->
+        {:error, :invalid_comment_creator}
+    end
+  end
+
+  defp call_comment_creator(_comment_creator, _issue_id, _body, _comment_opts), do: {:error, :invalid_comment_creator}
+
+  defp comment_parent_opts(opts) do
+    case command_comment_id(opts) do
+      parent_id when is_binary(parent_id) and parent_id != "" -> [parent_id: parent_id]
+      _ -> []
+    end
+  end
+
+  defp command_comment_id(opts) do
+    opts
+    |> Keyword.get(:comment_command_context)
+    |> case do
+      context when is_map(context) ->
+        context
+        |> map_value(["comment_id", :comment_id, "command_comment_id", :command_comment_id])
+        |> normalize_optional_string()
+
+      _context ->
+        nil
+    end
+  end
+
+  defp maybe_put_parent_id_response(payload, parent_id) when is_binary(parent_id) do
+    Map.put(payload, "parentId", parent_id)
+  end
+
+  defp maybe_put_parent_id_response(payload, _parent_id), do: payload
 
   defp normalize_issue_id(arguments, opts) do
     issue_id =
@@ -364,6 +411,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "Linear comment creation did not report success."
+      }
+    }
+  end
+
+  defp tool_error_payload(:parent_comment_unsupported) do
+    %{
+      "error" => %{
+        "message" => "Linear comment creation requires parent-comment support for this command run."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_comment_creator) do
+    %{
+      "error" => %{
+        "message" => "Linear comment creation is not configured correctly."
       }
     }
   end

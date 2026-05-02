@@ -42,9 +42,14 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
+    create_comment(issue_id, body, [])
+  end
+
+  @spec create_comment(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def create_comment(issue_id, body, opts) when is_list(opts) do
     case Application.get_env(:symphony_elixir, :memory_tracker_create_comment_result, :ok) do
       :ok ->
-        send_event({:memory_tracker_comment, issue_id, body})
+        send_event(comment_event(issue_id, body, opts))
         :ok
 
       {:error, reason} ->
@@ -70,6 +75,16 @@ defmodule SymphonyElixir.Tracker.Memory do
     case Application.get_env(:symphony_elixir, :memory_tracker_recipient) do
       pid when is_pid(pid) -> send(pid, message)
       _ -> :ok
+    end
+  end
+
+  defp comment_event(issue_id, body, opts) do
+    case Keyword.get(opts, :parent_id) do
+      parent_id when is_binary(parent_id) and parent_id != "" ->
+        {:memory_tracker_comment, issue_id, body, parent_id: parent_id}
+
+      _ ->
+        {:memory_tracker_comment, issue_id, body}
     end
   end
 

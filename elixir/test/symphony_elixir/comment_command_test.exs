@@ -72,7 +72,7 @@ defmodule SymphonyElixir.CommentCommandTest do
     assert run_opts[:comment_command_context].command == "/roadmap-review"
     assert run_opts[:continuation_states] == ["Backlog"]
     assert run_opts[:max_turns] >= 2
-    assert_receive {:memory_tracker_comment, "issue-1", marker_body}
+    assert_receive {:memory_tracker_comment, "issue-1", marker_body, parent_id: "comment-2"}
     assert marker_body =~ "Symphony command marker"
     assert marker_body =~ "command_comment_id: comment-2"
     assert marker_body =~ "command: /roadmap-review"
@@ -108,6 +108,40 @@ defmodule SymphonyElixir.CommentCommandTest do
     Orchestrator.process_comment_commands_for_test(entries, %State{max_concurrent_agents: 4},
       dispatch_fun: fn _issue, state_acc, _run_opts ->
         flunk("marked commands must not dispatch")
+        state_acc
+      end
+    )
+
+    refute_receive {:memory_tracker_comment, _, _}
+  end
+
+  test "skips comment commands that already have durable threaded Linear markers" do
+    issue = %Issue{id: "issue-1", identifier: "HIN-1", title: "Plan", state: "Backlog"}
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    planner_path = Workflow.workflow_file_path() |> Path.dirname() |> Path.join("WORKFLOW_PLANNER.md")
+    write_workflow_file!(planner_path, prompt: "Symphony Planner Workflow")
+
+    entries = [
+      %{issue: issue, comment: %{id: "comment-1", body: "/roadmap-review"}},
+      %{
+        issue: issue,
+        comment: %{
+          id: "marker-1",
+          parent_id: "comment-1",
+          body: """
+          Symphony command marker
+          command_comment_id: comment-1
+          command: /roadmap-review
+          status: claimed
+          """
+        }
+      }
+    ]
+
+    Orchestrator.process_comment_commands_for_test(entries, %State{max_concurrent_agents: 4},
+      dispatch_fun: fn _issue, state_acc, _run_opts ->
+        flunk("threaded marked commands must not dispatch")
         state_acc
       end
     )
@@ -171,10 +205,10 @@ defmodule SymphonyElixir.CommentCommandTest do
         end
       )
 
-    assert_receive {:memory_tracker_comment, "issue-1", marker_body}
+    assert_receive {:memory_tracker_comment, "issue-1", marker_body, parent_id: "comment-1"}
     assert marker_body =~ "Symphony command marker"
     assert marker_body =~ "command_comment_id: comment-1"
-    assert_receive {:memory_tracker_comment, "issue-1", body}
+    assert_receive {:memory_tracker_comment, "issue-1", body, parent_id: "comment-1"}
     assert body =~ "Acknowledged `/approve-plan`"
     assert body =~ "will not move the issue to `Todo` automatically"
     assert MapSet.member?(state.comment_command_debounce_ids, "comment-1")
@@ -205,12 +239,12 @@ defmodule SymphonyElixir.CommentCommandTest do
     assert run_opts[:comment_command_context].arguments == "fix docs"
     assert run_opts[:continuation_states] == ["In Review"]
     assert run_opts[:max_turns] >= 2
-    assert_receive {:memory_tracker_comment, "issue-1", marker_body}
+    assert_receive {:memory_tracker_comment, "issue-1", marker_body, parent_id: "comment-1"}
     assert marker_body =~ "command_comment_id: comment-1"
-    assert_receive {:memory_tracker_comment, "issue-2", body}
+    assert_receive {:memory_tracker_comment, "issue-2", body, parent_id: "comment-2"}
     assert body =~ "Symphony command marker"
     assert body =~ "command_comment_id: comment-2"
-    assert_receive {:memory_tracker_comment, "issue-2", body}
+    assert_receive {:memory_tracker_comment, "issue-2", body, parent_id: "comment-2"}
     assert body =~ "only routes issues that are already in `In Review`"
   end
 end

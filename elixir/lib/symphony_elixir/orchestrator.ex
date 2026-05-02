@@ -999,7 +999,7 @@ defmodule SymphonyElixir.Orchestrator do
     """
 
     with {:ok, state} <- claim_comment_command(command, state, opts),
-         :ok <- Tracker.create_comment(command.issue.id, body) do
+         :ok <- Tracker.create_comment(command.issue.id, body, command_reply_opts(command)) do
       Logger.info("Acknowledged Linear comment command #{command.command} for #{issue_context(command.issue)}")
       state
     else
@@ -1024,7 +1024,7 @@ defmodule SymphonyElixir.Orchestrator do
       """
 
       with {:ok, state} <- claim_comment_command(command, state, opts),
-           :ok <- Tracker.create_comment(command.issue.id, body) do
+           :ok <- Tracker.create_comment(command.issue.id, body, command_reply_opts(command)) do
         state
       else
         {:error, {:comment_command_marker_failed, reason}} ->
@@ -1082,7 +1082,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, mark_comment_command_debounced(state, command.comment_id)}
 
       true ->
-        case Tracker.create_comment(command.issue.id, command_marker_body(command)) do
+        case Tracker.create_comment(command.issue.id, command_marker_body(command), command_reply_opts(command)) do
           :ok ->
             {:ok, mark_comment_command_debounced(state, command.comment_id)}
 
@@ -1099,6 +1099,10 @@ defmodule SymphonyElixir.Orchestrator do
     command: #{command.command}
     status: #{@comment_command_marker_status}
     """
+  end
+
+  defp command_reply_opts(%CommentCommand{comment_id: comment_id}) when is_binary(comment_id) do
+    [parent_id: comment_id]
   end
 
   defp durable_comment_command_marker?(comment_id, opts) when is_binary(comment_id) do
@@ -1239,7 +1243,9 @@ defmodule SymphonyElixir.Orchestrator do
       command: command.command,
       arguments: command.arguments,
       comment_id: command.comment_id,
-      body: command.body
+      body: command.body,
+      issue_id: command.issue.id,
+      issue_identifier: command.issue.identifier
     }
   end
 

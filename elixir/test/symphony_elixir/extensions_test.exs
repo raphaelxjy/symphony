@@ -201,8 +201,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert {:ok, [^comment_entry]} = SymphonyElixir.Tracker.fetch_recent_issue_comments()
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "reply", parent_id: "comment-parent")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_comment, "issue-1", "reply", parent_id: "comment-parent"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
@@ -236,6 +238,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert :ok = Adapter.create_comment("issue-1", "hello")
     assert_receive {:graphql_called, create_comment_query, %{body: "hello", issueId: "issue-1"}}
     assert create_comment_query =~ "commentCreate"
+    assert create_comment_query =~ "parentId"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.create_comment("issue-1", "reply", parent_id: "comment-parent")
+    assert_receive {:graphql_called, _create_reply_query, %{body: "reply", issueId: "issue-1", parentId: "comment-parent"}}
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.create_comment("issue-1", "top-level", parent_id: "  ")
+    assert_receive {:graphql_called, _create_top_level_query, %{body: "top-level", issueId: "issue-1"}}
 
     Process.put(
       {FakeLinearClient, :graphql_result},

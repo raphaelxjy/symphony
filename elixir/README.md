@@ -138,7 +138,9 @@ Notes:
   checks the first non-blank line only, ignores ordinary comments, records seen command comment IDs
   in memory for the current runner session, routes planner commands through `WORKFLOW_PLANNER.md`,
   acknowledges `/approve-plan` without changing state, and only accepts `/rework-pr` on issues that
-  are already in review.
+  are already in review. Command markers and command-scoped handoff, blocker, no-op, or acknowledgement
+  comments are posted as replies to the triggering command comment when Linear parent comments are
+  available.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

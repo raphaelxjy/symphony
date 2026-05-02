@@ -371,6 +371,46 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.assigned_to_worker
   end
 
+  test "linear client includes threaded comment replies in command polling entries" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "MT-1",
+      "title" => "Threaded command",
+      "state" => %{"name" => "In Review"},
+      "comments" => %{
+        "nodes" => [
+          %{
+            "id" => "command-comment-1",
+            "body" => "/rework-pr update docs",
+            "createdAt" => "2026-01-01T00:00:00Z",
+            "updatedAt" => "2026-01-01T00:00:00Z",
+            "children" => %{
+              "nodes" => [
+                %{
+                  "id" => "marker-comment-1",
+                  "parentId" => "command-comment-1",
+                  "body" => """
+                  Symphony command marker
+                  command_comment_id: command-comment-1
+                  command: /rework-pr
+                  status: claimed
+                  """,
+                  "createdAt" => "2026-01-01T00:01:00Z",
+                  "updatedAt" => "2026-01-01T00:01:00Z"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+
+    assert [
+             %{comment: %{id: "command-comment-1", parent_id: nil}},
+             %{comment: %{id: "marker-comment-1", parent_id: "command-comment-1"}}
+           ] = Client.issue_comment_entries_for_test([raw_issue])
+  end
+
   test "linear client pagination merge helper preserves issue ordering" do
     issue_page_1 = [
       %Issue{id: "issue-1", identifier: "MT-1"},
