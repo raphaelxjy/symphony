@@ -8,8 +8,8 @@ defmodule SymphonyElixir.Linear.Adapter do
   alias SymphonyElixir.Linear.Client
 
   @create_comment_mutation """
-  mutation SymphonyCreateComment($issueId: String!, $body: String!) {
-    commentCreate(input: {issueId: $issueId, body: $body}) {
+  mutation SymphonyCreateComment($issueId: String!, $body: String!, $parentId: String) {
+    commentCreate(input: {issueId: $issueId, body: $body, parentId: $parentId}) {
       success
     }
   }
@@ -51,7 +51,16 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
-    with {:ok, response} <- client_module().graphql(@create_comment_mutation, %{issueId: issue_id, body: body}),
+    create_comment(issue_id, body, [])
+  end
+
+  @spec create_comment(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def create_comment(issue_id, body, opts) when is_binary(issue_id) and is_binary(body) and is_list(opts) do
+    variables =
+      %{issueId: issue_id, body: body}
+      |> maybe_put_parent_id(Keyword.get(opts, :parent_id))
+
+    with {:ok, response} <- client_module().graphql(@create_comment_mutation, variables),
          true <- get_in(response, ["data", "commentCreate", "success"]) == true do
       :ok
     else
@@ -79,6 +88,15 @@ defmodule SymphonyElixir.Linear.Adapter do
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end
+
+  defp maybe_put_parent_id(variables, parent_id) when is_binary(parent_id) do
+    case String.trim(parent_id) do
+      "" -> variables
+      trimmed -> Map.put(variables, :parentId, trimmed)
+    end
+  end
+
+  defp maybe_put_parent_id(variables, _parent_id), do: variables
 
   defp resolve_state_id(issue_id, state_name) do
     with {:ok, response} <-

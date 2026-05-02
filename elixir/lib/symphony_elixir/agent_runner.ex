@@ -122,7 +122,8 @@ defmodule SymphonyElixir.AgentRunner do
              prompt,
              issue,
              on_message: codex_message_handler(codex_update_recipient, issue),
-             require_final_response_item: command_context?(opts)
+             require_final_response_item: command_context?(opts),
+             comment_command_context: Keyword.get(opts, :comment_command_context)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -257,21 +258,23 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp command_minimum_turn_continuation(issue, issue_state_fetcher, opts, turn_number, max_turns) do
     if command_minimum_turn_possible?(opts, turn_number, max_turns) do
-      case refresh_issue_for_command_continuation(issue, issue_state_fetcher) do
-        {:ok, %Issue{} = refreshed_issue} ->
-          if terminal_issue_state?(issue_state(refreshed_issue)) do
-            :not_required
-          else
-            {:continue, refreshed_issue}
-          end
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      issue
+      |> refresh_issue_for_command_continuation(issue_state_fetcher)
+      |> command_minimum_turn_continuation_result()
     else
       :not_required
     end
   end
+
+  defp command_minimum_turn_continuation_result({:ok, %Issue{} = refreshed_issue}) do
+    if terminal_issue_state?(issue_state(refreshed_issue)) do
+      :not_required
+    else
+      {:continue, refreshed_issue}
+    end
+  end
+
+  defp command_minimum_turn_continuation_result({:error, reason}), do: {:error, reason}
 
   defp command_minimum_turn_possible?(opts, turn_number, max_turns) do
     command_context?(opts) and turn_number < @comment_command_min_turns and turn_number < max_turns

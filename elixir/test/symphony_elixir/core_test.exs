@@ -1830,6 +1830,110 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner parents Linear comment tool calls during command runs" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-command-reply-tool-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runner-reply"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-runner-reply"}}}'
+            printf '%s\\n' '{"id":103,"method":"item/tool/call","params":{"name":"linear_create_comment","callId":"call-runner-reply","threadId":"thread-runner-reply","turnId":"turn-runner-reply","arguments":{"body":"Command handoff."}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"item/completed","params":{"item":{"id":"msg-runner-reply","type":"agentMessage"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-runner-reply",
+             identifier: "MT-90S",
+             title: "Command reply tool",
+             description: "Done after command handoff",
+             state: "Done"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-runner-reply",
+        identifier: "MT-90S",
+        title: "Command reply tool",
+        description: "Ensure command handoffs are threaded",
+        state: "In Review",
+        url: "https://example.org/issues/MT-90S",
+        labels: ["workflow"]
+      }
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 comment_command_context: %{
+                   command: "/rework-pr",
+                   arguments: "post handoff",
+                   comment_id: "command-comment-runner",
+                   body: "/rework-pr post handoff"
+                 }
+               )
+
+      assert_receive {:memory_tracker_comment, "issue-runner-reply", "Command handoff.", parent_id: "command-comment-runner"}
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server starts with workspace cwd and expected startup command" do
     test_root =
       Path.join(

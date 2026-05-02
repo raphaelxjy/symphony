@@ -133,8 +133,18 @@ defmodule SymphonyElixir.Linear.Client do
           nodes {
             id
             body
+            parentId
             createdAt
             updatedAt
+            children(last: $commentFirst) {
+              nodes {
+                id
+                body
+                parentId
+                createdAt
+                updatedAt
+              }
+            }
           }
         }
         createdAt
@@ -291,6 +301,10 @@ defmodule SymphonyElixir.Linear.Client do
     |> Enum.reduce([], &prepend_page_issues/2)
     |> finalize_paginated_issues()
   end
+
+  @doc false
+  @spec issue_comment_entries_for_test([map()]) :: [map()]
+  def issue_comment_entries_for_test(nodes) when is_list(nodes), do: issue_comment_entries(nodes, nil)
 
   @doc false
   @spec fetch_issue_states_by_ids_for_test([String.t()], (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
@@ -591,23 +605,50 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_comment_nodes(nodes) when is_list(nodes) do
     nodes
-    |> Enum.map(&normalize_comment/1)
+    |> Enum.flat_map(&normalize_comment_with_children/1)
     |> Enum.reject(&is_nil/1)
   end
 
   defp normalize_comment_nodes(_nodes), do: []
+
+  defp normalize_comment_with_children(comment) when is_map(comment) do
+    comment
+    |> normalize_comment()
+    |> case do
+      nil -> []
+      normalized -> [normalized | normalize_child_comments(comment)]
+    end
+  end
+
+  defp normalize_comment_with_children(_comment), do: []
 
   defp normalize_comment(%{"id" => id, "body" => body} = comment)
        when is_binary(id) and is_binary(body) do
     %{
       id: id,
       body: body,
+      parent_id: normalize_optional_string(comment["parentId"]),
       created_at: parse_datetime(comment["createdAt"]),
       updated_at: parse_datetime(comment["updatedAt"])
     }
   end
 
   defp normalize_comment(_comment), do: nil
+
+  defp normalize_child_comments(%{"children" => %{"nodes" => nodes}}) when is_list(nodes) do
+    Enum.map(nodes, &normalize_comment/1)
+  end
+
+  defp normalize_child_comments(_comment), do: []
+
+  defp normalize_optional_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_optional_string(_value), do: nil
 
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do

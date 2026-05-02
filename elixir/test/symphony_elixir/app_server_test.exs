@@ -1252,6 +1252,80 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server parents Linear comment tool calls during command runs" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-command-reply-tool-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-90R")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-90r"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-90r"}}}'
+            printf '%s\\n' '{"id":103,"method":"item/tool/call","params":{"name":"linear_create_comment","callId":"call-90r","threadId":"thread-90r","turnId":"turn-90r","arguments":{"body":"Command handoff."}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-command-tool",
+        identifier: "MT-90R",
+        title: "Command reply tool",
+        description: "Ensure command handoffs are threaded",
+        state: "In Review",
+        url: "https://example.org/issues/MT-90R",
+        labels: ["workflow"]
+      }
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Post command handoff", issue, comment_command_context: %{comment_id: "command-comment-1"})
+
+      assert_receive {:memory_tracker_comment, "issue-command-tool", "Command handoff.", parent_id: "command-comment-1"}
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server emits tool_call_failed for supported tool failures" do
     test_root =
       Path.join(

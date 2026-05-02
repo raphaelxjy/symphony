@@ -105,6 +105,53 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
   end
 
+  test "linear_create_comment replies under command comments during command runs" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"body" => "## Handoff\n\nDone."},
+        current_issue: %Issue{id: "issue-123"},
+        comment_command_context: %{comment_id: "command-comment-1"},
+        comment_creator: fn issue_id, body, opts ->
+          send(test_pid, {:comment_created, issue_id, body, opts})
+          :ok
+        end
+      )
+
+    assert_received {:comment_created, "issue-123", "## Handoff\n\nDone.", [parent_id: "command-comment-1"]}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "ok" => true,
+             "issueId" => "issue-123",
+             "parentId" => "command-comment-1",
+             "action" => "linear_create_comment"
+           }
+  end
+
+  test "linear_create_comment fails closed when command runs cannot create replies" do
+    response =
+      DynamicTool.execute(
+        "linear_create_comment",
+        %{"body" => "Done."},
+        current_issue: %Issue{id: "issue-123"},
+        comment_command_context: %{comment_id: "command-comment-1"},
+        comment_creator: fn _issue_id, _body ->
+          flunk("two-argument comment creators cannot safely create command replies")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Linear comment creation requires parent-comment support for this command run."
+             }
+           }
+  end
+
   test "linear_update_issue_state moves the current issue by state name" do
     test_pid = self()
 
